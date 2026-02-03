@@ -107,6 +107,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--auto-s0",
+        action="store_true",
+        help=("Estimate s0 per frame from depth and intrinsics (default: off)."),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=0,
@@ -478,6 +483,22 @@ def ensure_depth_channel(depth_map: np.ndarray) -> np.ndarray:
     return depth_map
 
 
+def estimate_s0_from_depth(
+    depth_map: np.ndarray, intrinsic: np.ndarray, eps: float = 1e-6
+) -> float:
+    if depth_map.ndim == 3:
+        depth_map = depth_map.squeeze(-1)
+    valid = depth_map > eps
+    if not np.any(valid):
+        return 0.0
+    fx = float(intrinsic[0, 0])
+    fy = float(intrinsic[1, 1])
+    dx = depth_map / max(fx, eps)
+    dy = depth_map / max(fy, eps)
+    spacing = np.sqrt(dx * dx + dy * dy)
+    return float(np.median(spacing[valid]))
+
+
 def build_projection_matrix(
     intrinsic: np.ndarray,
     width: int,
@@ -715,6 +736,11 @@ def main() -> None:
             points = world_points[idx][valid_mask]
             colors = images_np[idx][valid_mask]
             confidences = conf_frame[valid_mask]
+
+            if args.auto_s0:
+                s0 = estimate_s0_from_depth(depth_frame, intrinsic[idx])
+                if s0 > 0.0:
+                    renderer.s0 = s0
 
             view_mat = build_view_matrix(extrinsic[next_idx])
             if args.upsample_depth:
