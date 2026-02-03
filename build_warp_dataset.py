@@ -43,14 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--depth-conf-threshold",
         type=float,
-        default=2.0,
-        help="Filter depth points with confidence below this value (default: 2.0).",
+        default=1.01,
+        help="Filter depth points with confidence below this value (default: 1.01).",
     )
     parser.add_argument(
         "--sigma",
         type=float,
-        default=32.0,
-        help="Sigma for fake Gaussian splatting (default: 32.0)",
+        default=20.0,
+        help="Sigma for fake Gaussian splatting (default: 20.0)",
     )
     parser.add_argument(
         "--device",
@@ -73,23 +73,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Automatically select frames per scene based on transforms.json "
-            "camera motion (default: off)."
+            "view overlap (default: off)."
         ),
     )
     parser.add_argument(
-        "--target-motion",
+        "--target-overlap",
         type=float,
-        default=45,
+        default=0.5,
         help=(
-            "Target normalized motion between selected frames when auto-skipping "
-            "(default: 45)."
+            "Target view overlap (0-1) between selected frames when auto-skipping "
+            "(default: 0.5)."
         ),
-    )
-    parser.add_argument(
-        "--rotation-weight",
-        type=float,
-        default=2.0,
-        help="Weight to apply to rotation motion (default: 2.0).",
     )
     parser.add_argument(
         "--resize-width",
@@ -136,16 +130,21 @@ def resolve_images_dir(scene_dir: Path) -> Path | None:
     return None
 
 
-def load_transforms(scene_dir: Path) -> list[dict]:
+def load_transforms(scene_dir: Path) -> tuple[list[dict], dict[str, float]]:
     transforms_path = scene_dir / "transforms.json"
     if not transforms_path.exists():
-        return []
+        return [], {}
     with transforms_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     frames = data.get("frames", [])
     if not isinstance(frames, list):
-        return []
-    return frames
+        frames = []
+    metadata = {}
+    for key in ("camera_angle_x", "camera_angle_y", "fl_x", "fl_y", "w", "h"):
+        value = data.get(key)
+        if isinstance(value, (int, float)):
+            metadata[key] = float(value)
+    return frames, metadata
 
 
 def build_frame_paths(scene_dir: Path, frames: list[dict]) -> list[tuple[dict, Path]]:
@@ -169,7 +168,9 @@ def build_frame_paths(scene_dir: Path, frames: list[dict]) -> list[tuple[dict, P
     return frame_paths
 
 
-def compute_motion_scores(frames: list[dict], rotation_weight: float) -> np.ndarray:
+def compute_overlap_scores(
+    frames: list[dict], metadata: dict[str, float]
+) -> np.ndarray:
     if len(frames) < 2:
         return np.array([], dtype=np.float64)
     positions = []
@@ -199,32 +200,58 @@ def compute_motion_scores(frames: list[dict], rotation_weight: float) -> np.ndar
         return np.array([], dtype=np.float64)
 
     angles_arr = np.array(angles, dtype=np.float64)
-    dist_ref = float(np.median(dists))
-    angle_ref = float(np.median(angles_arr))
     eps = 1e-6
-    if dist_ref < eps and angle_ref < eps:
-        return np.zeros_like(angles_arr, dtype=np.float64)
-    dist_scale = dist_ref if dist_ref >= eps else 1.0
-    angle_scale = angle_ref if angle_ref >= eps else 1.0
-    return np.sqrt(
-        (dists / dist_scale) ** 2 + (rotation_weight * angles_arr / angle_scale) ** 2
-    )
+    default_fov = np.deg2rad(60.0)
+    fov_candidates = []
+    if "camera_angle_x" in metadata:
+        fov_candidates.append(metadata["camera_angle_x"])
+    if "camera_angle_y" in metadata:
+        fov_candidates.append(metadata["camera_angle_y"])
+    if "fl_x" in metadata and "w" in metadata and metadata["fl_x"] > eps:
+        fov_candidates.append(2.0 * np.arctan(metadata["w"] / (2.0 * metadata["fl_x"])))
+    if "fl_y" in metadata and "h" in metadata and metadata["fl_y"] > eps:
+        fov_candidates.append(2.0 * np.arctan(metadata["h"] / (2.0 * metadata["fl_y"])))
+    fov_ref = min(fov_candidates) if fov_candidates else default_fov
+    fov_ref = max(float(fov_ref), eps)
+
+    center = positions_arr.mean(axis=0)
+    depth_candidates = []
+    dist_to_center = np.linalg.norm(positions_arr - center, axis=1)
+    if dist_to_center.size > 0:
+        depth_candidates.append(float(np.median(dist_to_center)))
+    if dists.size > 0:
+        depth_candidates.append(float(np.median(dists)))
+    depth_ref = max(max(depth_candidates, default=1.0), eps)
+
+    tan_half_fov = np.tan(fov_ref * 0.5)
+    trans_scale = 2.0 * depth_ref * tan_half_fov
+    overlaps = []
+    for dist, angle in zip(dists, angles_arr):
+        rot_overlap = max(0.0, 1.0 - float(angle) / fov_ref)
+        if trans_scale > eps:
+            trans_overlap = max(0.0, 1.0 - float(dist) / trans_scale)
+        else:
+            trans_overlap = 0.0
+        overlaps.append(min(rot_overlap, trans_overlap))
+    return np.array(overlaps, dtype=np.float64)
 
 
-def select_frame_indices_by_motion(
-    scores: np.ndarray, target_motion: float
+def select_frame_indices_by_overlap(
+    overlaps: np.ndarray, target_overlap: float
 ) -> list[int]:
-    if scores.size == 0:
+    if overlaps.size == 0:
         return [0]
+    target_overlap = float(np.clip(target_overlap, 0.0, 1.0))
+    target_loss = 1.0 - target_overlap
     selected = [0]
     accumulated = 0.0
-    for idx, score in enumerate(scores, start=1):
-        accumulated += float(score)
-        if accumulated >= target_motion:
+    for idx, overlap in enumerate(overlaps, start=1):
+        accumulated += 1.0 - float(np.clip(overlap, 0.0, 1.0))
+        if accumulated >= target_loss:
             selected.append(idx)
             accumulated = 0.0
-    if selected[-1] != len(scores):
-        selected.append(len(scores))
+    if selected[-1] != len(overlaps):
+        selected.append(len(overlaps))
     return selected
 
 
@@ -232,20 +259,19 @@ def scene_image_paths(
     scene_dir: Path,
     skip_every: int,
     auto_skip: bool,
-    target_motion: float,
-    rotation_weight: float,
+    target_overlap: float,
     limit: int,
 ) -> tuple[list[Path], str | None]:
-    frames = load_transforms(scene_dir) if auto_skip else []
+    frames, metadata = load_transforms(scene_dir) if auto_skip else ([], {})
     frame_paths = build_frame_paths(scene_dir, frames) if frames else []
     if frame_paths:
         image_paths = [path for _, path in frame_paths]
         auto_skip_note = None
         if auto_skip:
-            scores = compute_motion_scores(
-                [frame for frame, _ in frame_paths], rotation_weight
+            overlaps = compute_overlap_scores(
+                [frame for frame, _ in frame_paths], metadata
             )
-            indices = select_frame_indices_by_motion(scores, target_motion)
+            indices = select_frame_indices_by_overlap(overlaps, target_overlap)
             image_paths = [image_paths[idx] for idx in indices]
             auto_skip_note = (
                 f"auto-selected {len(image_paths)} of {len(frame_paths)} frames"
@@ -476,8 +502,7 @@ def main() -> None:
                 scene_dir,
                 args.skip_every,
                 args.auto_skip,
-                args.target_motion,
-                args.rotation_weight,
+                args.target_overlap,
                 args.limit,
             )
         except ValueError as exc:
@@ -490,7 +515,7 @@ def main() -> None:
         if auto_skip_note is not None:
             print(
                 f"Auto skip for {scene_dir.name}: {auto_skip_note} "
-                f"(target motion {args.target_motion})."
+                f"(target overlap {args.target_overlap})."
             )
         print(f"Loading {len(image_paths)} images from {scene_dir}...")
         images = load_and_preprocess_images(
@@ -501,21 +526,6 @@ def main() -> None:
         model_height, model_width = images.shape[-2:]
         render_width = resize_size[0] if resize_size is not None else model_width
         render_height = resize_size[1] if resize_size is not None else model_height
-
-        if renderer is None:
-            renderer = HoleFillingRenderer(
-                render_width,
-                render_height,
-                shaders_dir=shaders_dir,
-                confidence_threshold=args.depth_conf_threshold,
-                jfa_mask_sigma=args.sigma,
-            )
-            renderer_size = (render_height, render_width)
-        elif renderer_size != (render_height, render_width):
-            raise ValueError(
-                "All scenes must share the same model resolution to reuse the renderer. "
-                f"Expected {renderer_size}, got {(render_height, render_width)} for {scene_dir}."
-            )
 
         preprocess_metas = build_preprocess_metadata(
             image_paths,
@@ -544,6 +554,23 @@ def main() -> None:
         extrinsic = extrinsic.squeeze(0).cpu().numpy()
         intrinsic = intrinsic.squeeze(0).cpu().numpy()
         images_np = images.cpu().numpy().transpose(0, 2, 3, 1)
+
+        if renderer is None:
+            renderer = HoleFillingRenderer(
+                render_width,
+                render_height,
+                shaders_dir=shaders_dir,
+                confidence_threshold=args.depth_conf_threshold,
+                jfa_mask_sigma=args.sigma,
+            )
+            renderer_size = (render_height, render_width)
+        elif renderer_size != (render_height, render_width):
+            raise ValueError(
+                "All scenes must share the same model resolution to reuse the renderer. "
+                f"Expected {renderer_size}, got {(render_height, render_width)} for {scene_dir}."
+            )
+        else:
+            renderer.confidence_threshold = args.depth_conf_threshold
 
         world_points = unproject_depth_map_to_point_map(depth, extrinsic, intrinsic)
 
