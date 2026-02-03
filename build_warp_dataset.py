@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as torch_nn
 from PIL import Image
 
 from vggt.models.vggt import VGGT
@@ -96,6 +97,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Resize input images to this height before preprocessing (default: 0).",
+    )
+    parser.add_argument(
+        "--upsample-depth",
+        action="store_true",
+        help=(
+            "Upsample VGGT depth/confidence maps to the output resolution before rendering "
+            "(default: off)."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -405,12 +414,68 @@ def restore_to_original_resolution(
     return np.array(image)
 
 
+def restore_map_to_original_resolution(
+    model_map: np.ndarray,
+    meta: dict[str, float],
+    mode: str,
+    *,
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    map_tensor = torch.from_numpy(model_map).unsqueeze(0).unsqueeze(0)
+    left = int(meta["total_pad_left"])
+    top = int(meta["total_pad_top"])
+    right = left + int(meta["effective_width"])
+    bottom = top + int(meta["effective_height"])
+    map_tensor = map_tensor[:, :, top:bottom, left:right]
+
+    if mode == "crop":
+        resized_width = int(meta["resized_width"])
+        resized_height = int(meta["resized_height"])
+        canvas = torch.full(
+            (1, 1, resized_height, resized_width),
+            fill_value,
+            dtype=map_tensor.dtype,
+        )
+        canvas[:, :, int(meta["crop_top"]) :, :] = map_tensor
+        map_tensor = canvas
+
+    map_tensor = torch_nn.interpolate(
+        map_tensor,
+        size=(int(meta["orig_height"]), int(meta["orig_width"])),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return map_tensor.squeeze(0).squeeze(0).numpy()
+
+
+def resize_map_to_output(
+    map_data: np.ndarray, output_size: tuple[int, int]
+) -> np.ndarray:
+    output_width, output_height = output_size
+    if map_data.shape == (output_height, output_width):
+        return map_data
+    map_tensor = torch.from_numpy(map_data).unsqueeze(0).unsqueeze(0)
+    map_tensor = torch_nn.interpolate(
+        map_tensor,
+        size=(output_height, output_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return map_tensor.squeeze(0).squeeze(0).numpy()
+
+
 def build_view_matrix(extrinsic: np.ndarray) -> np.ndarray:
     view = np.eye(4, dtype=np.float32)
     view[:3, :3] = extrinsic[:3, :3]
     view[:3, 3] = extrinsic[:3, 3]
     conversion = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
     return conversion @ view
+
+
+def ensure_depth_channel(depth_map: np.ndarray) -> np.ndarray:
+    if depth_map.ndim == 3:
+        return depth_map[..., None]
+    return depth_map
 
 
 def build_projection_matrix(
@@ -524,8 +589,6 @@ def main() -> None:
         )
         images = images.to(device)
         model_height, model_width = images.shape[-2:]
-        render_width = resize_size[0] if resize_size is not None else model_width
-        render_height = resize_size[1] if resize_size is not None else model_height
 
         preprocess_metas = build_preprocess_metadata(
             image_paths,
@@ -534,6 +597,29 @@ def main() -> None:
             model_height=model_height,
             model_width=model_width,
         )
+
+        if args.upsample_depth:
+            if resize_size is not None:
+                output_size = resize_size
+            else:
+                output_size = (
+                    int(preprocess_metas[0]["orig_width"]),
+                    int(preprocess_metas[0]["orig_height"]),
+                )
+                for meta in preprocess_metas[1:]:
+                    if (
+                        int(meta["orig_width"]) != output_size[0]
+                        or int(meta["orig_height"]) != output_size[1]
+                    ):
+                        raise ValueError(
+                            "All images in a scene must share the same resolution to render "
+                            "high-res outputs."
+                        )
+            render_width, render_height = output_size
+        else:
+            output_size = None
+            render_width = resize_size[0] if resize_size is not None else model_width
+            render_height = resize_size[1] if resize_size is not None else model_height
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=dtype, enabled=device.type == "cuda"):
@@ -553,9 +639,52 @@ def main() -> None:
         depth_conf = depth_conf.squeeze(0).cpu().numpy()
         extrinsic = extrinsic.squeeze(0).cpu().numpy()
         intrinsic = intrinsic.squeeze(0).cpu().numpy()
-        images_np = images.cpu().numpy().transpose(0, 2, 3, 1)
+        if args.upsample_depth:
+            if output_size is None:
+                raise ValueError("Output size is required when upsampling depth.")
+            images_np = []
+            for path in image_paths:
+                with Image.open(path) as img:
+                    img = img.convert("RGB")
+                    if img.size != output_size:
+                        img = img.resize(output_size, Image.Resampling.BICUBIC)
+                    images_np.append(np.array(img, dtype=np.float32) / 255.0)
+            images_np = np.stack(images_np, axis=0)
 
-        if renderer is None:
+            depth_frames = []
+            conf_frames = []
+            intrinsic_frames = []
+            for idx, meta in enumerate(preprocess_metas):
+                depth_frame = depth[idx]
+                if depth_frame.ndim == 3:
+                    depth_frame = depth_frame.squeeze(-1)
+                conf_frame = depth_conf[idx]
+                if conf_frame.ndim == 3:
+                    conf_frame = conf_frame.squeeze(-1)
+
+                depth_frame = restore_map_to_original_resolution(
+                    depth_frame, meta, args.preprocess_mode
+                )
+                conf_frame = restore_map_to_original_resolution(
+                    conf_frame, meta, args.preprocess_mode, fill_value=0.0
+                )
+                depth_frame = resize_map_to_output(depth_frame, output_size)
+                conf_frame = resize_map_to_output(conf_frame, output_size)
+                depth_frames.append(depth_frame)
+                conf_frames.append(conf_frame)
+                intrinsic_frames.append(
+                    intrinsic_for_output(intrinsic[idx], meta, output_size)
+                )
+
+            depth = np.stack(depth_frames, axis=0)
+            depth_conf = np.stack(conf_frames, axis=0)
+            intrinsic = np.stack(intrinsic_frames, axis=0)
+            depth_for_unproject = ensure_depth_channel(depth)
+        else:
+            images_np = images.cpu().numpy().transpose(0, 2, 3, 1)
+            depth_for_unproject = ensure_depth_channel(depth)
+
+        if renderer is None or renderer_size != (render_height, render_width):
             renderer = HoleFillingRenderer(
                 render_width,
                 render_height,
@@ -564,24 +693,23 @@ def main() -> None:
                 jfa_mask_sigma=args.sigma,
             )
             renderer_size = (render_height, render_width)
-        elif renderer_size != (render_height, render_width):
-            raise ValueError(
-                "All scenes must share the same model resolution to reuse the renderer. "
-                f"Expected {renderer_size}, got {(render_height, render_width)} for {scene_dir}."
-            )
         else:
             renderer.confidence_threshold = args.depth_conf_threshold
 
-        world_points = unproject_depth_map_to_point_map(depth, extrinsic, intrinsic)
+        world_points = unproject_depth_map_to_point_map(
+            depth_for_unproject, extrinsic, intrinsic
+        )
 
         for idx in range(len(image_paths) - 1):
             next_idx = idx + 1
             next_name = image_paths[next_idx].stem
 
             depth_frame = depth[idx]
+            conf_frame = depth_conf[idx]
             if depth_frame.ndim == 3:
                 depth_frame = depth_frame.squeeze(-1)
-            conf_frame = depth_conf[idx]
+            if conf_frame.ndim == 3:
+                conf_frame = conf_frame.squeeze(-1)
             valid_mask = depth_frame > 1e-6
 
             points = world_points[idx][valid_mask]
@@ -589,9 +717,12 @@ def main() -> None:
             confidences = conf_frame[valid_mask]
 
             view_mat = build_view_matrix(extrinsic[next_idx])
-            target_intrinsic = intrinsic_for_output(
-                intrinsic[next_idx], preprocess_metas[next_idx], resize_size
-            )
+            if args.upsample_depth:
+                target_intrinsic = intrinsic[next_idx]
+            else:
+                target_intrinsic = intrinsic_for_output(
+                    intrinsic[next_idx], preprocess_metas[next_idx], resize_size
+                )
             proj_mat = build_projection_matrix(
                 target_intrinsic, render_width, render_height
             )
@@ -600,12 +731,12 @@ def main() -> None:
             model_render = renderer.render(
                 points, colors, confidences, view_mat, proj_mat, fov_y
             )
-            if resize_size is None:
+            if args.upsample_depth or resize_size is not None:
+                train_image = model_render
+            else:
                 train_image = restore_to_original_resolution(
                     model_render, preprocess_metas[next_idx], args.preprocess_mode
                 )
-            else:
-                train_image = model_render
 
             train_path = scene_output_dir / f"{next_name}_train.png"
             test_path = scene_output_dir / f"{next_name}_test.png"
@@ -638,6 +769,7 @@ def main() -> None:
         del images
         del predictions
         del depth
+        del depth_for_unproject
         del depth_conf
         del extrinsic
         del intrinsic
