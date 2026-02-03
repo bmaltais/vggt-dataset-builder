@@ -758,37 +758,37 @@ def main() -> None:
                 points, colors, confidences, view_mat, proj_mat, fov_y
             )
             if args.upsample_depth or resize_size is not None:
-                train_image = model_render
+                splats_image = model_render
             else:
-                train_image = restore_to_original_resolution(
+                splats_image = restore_to_original_resolution(
                     model_render, preprocess_metas[next_idx], args.preprocess_mode
                 )
 
-            train_path = scene_output_dir / f"{next_name}_train.png"
-            test_path = scene_output_dir / f"{next_name}_test.png"
+            splats_path = scene_output_dir / f"{next_name}_splats.png"
+            target_path = scene_output_dir / f"{next_name}_target.png"
             reference_path = scene_output_dir / f"{next_name}_reference.png"
 
-            Image.fromarray(train_image).save(train_path)
-            test_image = Image.open(image_paths[next_idx])
+            Image.fromarray(splats_image).save(splats_path)
+            target_image = Image.open(image_paths[next_idx])
             reference_image = Image.open(image_paths[idx])
             try:
-                test_image = test_image.convert("RGB")
+                target_image = target_image.convert("RGB")
                 reference_image = reference_image.convert("RGB")
                 if resize_size is not None:
-                    test_image = test_image.resize(
+                    target_image = target_image.resize(
                         resize_size, Image.Resampling.BICUBIC
                     )
                     reference_image = reference_image.resize(
                         resize_size, Image.Resampling.BICUBIC
                     )
-                test_image.save(test_path)
+                target_image.save(target_path)
                 reference_image.save(reference_path)
             finally:
-                test_image.close()
+                target_image.close()
                 reference_image.close()
 
             print(
-                f"Wrote {scene_dir.name}/{train_path.name}, {test_path.name}, "
+                f"Wrote {scene_dir.name}/{splats_path.name}, {target_path.name}, "
                 f"and {reference_path.name}"
             )
 
