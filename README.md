@@ -1,0 +1,3 @@
+- Make sure to clone this repo with `git clone --recurse-submodules`
+- Create and activate a new virtualenv, then run `pip install -r vggt/requirements.txt`, then run `pip install -r vggt/requirements_demo.txt`, then run `pip install moderngl glcontext`
+- Run `PYTHONPATH=vggt python build_warp_dataset.py`, optionally with arguments to customize behavior.
