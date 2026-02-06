@@ -73,6 +73,60 @@ uv run python build_warp_dataset.py --upsample-depth --auto-s0 --filter-sky --fi
 uv pip install opencv-python onnxruntime
 ```
 
+## ModelScope LoRA Training Dataset
+
+To prepare the generated warping dataset for LoRA training, use the `modelscope.py` script to reorganize files into the expected format:
+
+```bash
+uv run python modelscope.py
+```
+
+This creates a `modelscope-dataset/` folder with training triplets:
+- `<N>_start_1.<ext>`: Rendered splat image from reference view
+- `<N>_start_2.<ext>`: Reference image
+- `<N>_end.<ext>`: Target image
+- `<N>.txt`: Training prompt (if `--prompt` provided)
+
+### Example with prompt:
+
+```bash
+uv run python modelscope.py --prompt "a beautiful landscape with mountains and trees"
+```
+
+### Options:
+
+- `--output-dir <path>`: Input directory (default: output)
+- `--modelscope-dir <path>`: Output directory (default: modelscope-dataset)
+- `--prompt <text>`: Prompt text to save for each triplet as `<N>.txt`
+- `--quiet`: Suppress progress output
+
+## AI Toolkit Dataset
+
+AI Toolkit expects three folders: `control1`, `control2`, and `target`. Use `aitoolkit.py` to prepare this structure:
+
+```bash
+uv run python aitoolkit.py
+```
+
+This creates an `aitoolkit-dataset/` folder:
+- `control1/<N>.<ext>`: Rendered splat image
+- `control2/<N>.<ext>`: Reference image
+- `target/<N>.<ext>`: Target image
+- `target/<N>.txt`: Prompt text (if `--prompt` provided)
+
+### Example with prompt:
+
+```bash
+uv run python aitoolkit.py --prompt "refer to image 2, fix the distortion and blank areas in image 1"
+```
+
+### Options:
+
+- `--output-dir <path>`: Input directory (default: output)
+- `--aitoolkit-dir <path>`: Output directory (default: aitoolkit-dataset)
+- `--prompt <text>`: Prompt text to save as `target/<N>.txt`
+- `--quiet`: Suppress progress output
+
 ## Command-Line Options
 
 ### Input/Output
