@@ -128,6 +128,22 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help=("Limit to the first N images after filtering (default: 0, no limit)."),
     )
+    parser.add_argument(
+        "--max-megapixels",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum output resolution in megapixels when upsampling depth "
+            "(default: 1.0). Images exceeding this will be scaled down proportionally."
+        ),
+    )
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        default="jpg",
+        choices=["jpg", "jpeg", "png"],
+        help="Output image format (default: jpg).",
+    )
     return parser.parse_args()
 
 
@@ -146,6 +162,61 @@ def sorted_image_paths(input_dir: Path, skip_every: int) -> list[Path]:
     if len(image_paths) < 2:
         raise ValueError(f"Need at least two images after skipping in {input_dir}.")
     return image_paths
+
+
+def rescale_image_to_max_megapixels(
+    path: Path,
+    max_megapixels: float,
+    temp_dir: Path,
+) -> Path:
+    """Rescale image if it exceeds max megapixels, saving to temporary directory."""
+    if max_megapixels <= 0:
+        return path
+    with Image.open(path) as img:
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        img = img.convert("RGB")
+        width, height = img.size
+        megapixels = (width * height) / 1_000_000
+        if megapixels <= max_megapixels:
+            return path
+        scale = (max_megapixels / megapixels) ** 0.5
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        if new_width == width and new_height == height:
+            return path
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = temp_dir / f"{path.stem}_rescaled{path.suffix}"
+        resized = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        resized.save(temp_path)
+        return temp_path
+
+
+def rescale_scene_images_to_max_megapixels(
+    image_paths: list[Path],
+    max_megapixels: float,
+    temp_dir: Path,
+) -> tuple[list[Path], str | None]:
+    """Rescale all images in a scene to max megapixels limit."""
+    if max_megapixels <= 0:
+        return image_paths, None
+    resized_paths: list[Path] = []
+    resized_count = 0
+    for path in image_paths:
+        resized_path = rescale_image_to_max_megapixels(
+            path, max_megapixels, temp_dir
+        )
+        if resized_path != path:
+            resized_count += 1
+        resized_paths.append(resized_path)
+    note = None
+    if resized_count > 0:
+        note = (
+            f"Rescaled {resized_count}/{len(image_paths)} images to "
+            f"<= {max_megapixels:.2f}MP (in-memory)"
+        )
+    return resized_paths, note
 
 
 def resolve_images_dir(scene_dir: Path) -> Path | None:
@@ -591,6 +662,16 @@ def main() -> None:
     resize_size = None
     if args.resize_width > 0 and args.resize_height > 0:
         resize_size = (args.resize_width, args.resize_height)
+        resize_megapixels = (resize_size[0] * resize_size[1]) / 1_000_000
+        if args.max_megapixels > 0 and resize_megapixels > args.max_megapixels:
+            scale = (args.max_megapixels / resize_megapixels) ** 0.5
+            resize_size = (
+                max(1, int(round(resize_size[0] * scale))),
+                max(1, int(round(resize_size[1] * scale))),
+            )
+            print(
+                f"Rescaling resize-size to honor max megapixels: {resize_size[0]}x{resize_size[1]}"
+            )
 
     scene_dirs = list_scene_dirs(input_dir)
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -623,7 +704,8 @@ def main() -> None:
         scene_output_dir.mkdir(parents=True, exist_ok=True)
 
         # Skip if output folder already contains output files
-        existing_outputs = list(scene_output_dir.glob("*_splats.png"))
+        output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
+        existing_outputs = list(scene_output_dir.glob(f"*_splats.{output_ext}"))
         if existing_outputs:
             print(f"Skipping {scene_dir.name}: output folder already contains {len(existing_outputs)} output file(s).")
             continue
@@ -633,6 +715,18 @@ def main() -> None:
                 f"Auto skip for {scene_dir.name}: {auto_skip_note} "
                 f"(target overlap {args.target_overlap})."
             )
+        
+        # Create temporary directory for rescaled images (cleaned up later)
+        temp_resized_dir = None
+        if args.max_megapixels > 0:
+            import tempfile
+            temp_resized_dir = Path(tempfile.mkdtemp(prefix=f"rescale_{scene_dir.name}_"))
+            image_paths, resize_note = rescale_scene_images_to_max_megapixels(
+                image_paths, args.max_megapixels, temp_resized_dir
+            )
+            if resize_note is not None:
+                print(f"{scene_dir.name}: {resize_note}")
+        
         print(f"Loading {len(image_paths)} images from {scene_dir}...")
         images = load_and_preprocess_images(
             [str(path) for path in image_paths],
@@ -657,15 +751,39 @@ def main() -> None:
                     int(preprocess_metas[0]["orig_width"]),
                     int(preprocess_metas[0]["orig_height"]),
                 )
+                # Check if all images have the same resolution
+                mismatched_resolutions = False
                 for meta in preprocess_metas[1:]:
                     if (
                         int(meta["orig_width"]) != output_size[0]
                         or int(meta["orig_height"]) != output_size[1]
                     ):
-                        raise ValueError(
-                            "All images in a scene must share the same resolution to render "
-                            "high-res outputs."
-                        )
+                        mismatched_resolutions = True
+                        break
+                
+                # If resolutions don't match, use the minimum dimensions to avoid upscaling
+                if mismatched_resolutions:
+                    print(
+                        f"Images in {scene_dir.name} have different resolutions. "
+                        f"Using minimum dimensions for output size."
+                    )
+                    min_width = min(int(meta["orig_width"]) for meta in preprocess_metas)
+                    min_height = min(int(meta["orig_height"]) for meta in preprocess_metas)
+                    output_size = (min_width, min_height)
+            
+            # Apply megapixel limit
+            width, height = output_size
+            megapixels = (width * height) / 1_000_000
+            if megapixels > args.max_megapixels:
+                scale = (args.max_megapixels / megapixels) ** 0.5
+                width = int(width * scale)
+                height = int(height * scale)
+                output_size = (width, height)
+                print(
+                    f"Scaling output from {megapixels:.2f}MP to {args.max_megapixels:.2f}MP: "
+                    f"{output_size[0]}x{output_size[1]}"
+                )
+            
             render_width, render_height = output_size
         else:
             output_size = None
@@ -794,11 +912,13 @@ def main() -> None:
                     model_render, preprocess_metas[next_idx], args.preprocess_mode
                 )
 
-            splats_path = scene_output_dir / f"{next_name}_splats.png"
-            target_path = scene_output_dir / f"{next_name}_target.png"
-            reference_path = scene_output_dir / f"{next_name}_reference.png"
+            output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
+            splats_path = scene_output_dir / f"{next_name}_splats.{output_ext}"
+            target_path = scene_output_dir / f"{next_name}_target.{output_ext}"
+            reference_path = scene_output_dir / f"{next_name}_reference.{output_ext}"
 
-            Image.fromarray(splats_image).save(splats_path)
+            save_kwargs = {"quality": 95, "optimize": True} if output_ext == "jpg" else {}
+            Image.fromarray(splats_image).save(splats_path, **save_kwargs)
 
             if not args.no_confidence:
                 # Save confidence map for the source frame (idx) as grayscale
@@ -828,6 +948,7 @@ def main() -> None:
                     conf_image = Image.fromarray(conf_uint8, mode="L")
                     if resize_size is not None:
                         conf_image = conf_image.resize(resize_size, Image.Resampling.BICUBIC)
+                # Always save confidence as PNG for lossless grayscale
                 conf_path = scene_output_dir / f"{next_name}_confidence.png"
                 conf_image.save(conf_path)
             target_image = Image.open(image_paths[next_idx])
@@ -842,8 +963,8 @@ def main() -> None:
                     reference_image = reference_image.resize(
                         resize_size, Image.Resampling.BICUBIC
                     )
-                target_image.save(target_path)
-                reference_image.save(reference_path)
+                target_image.save(target_path, **save_kwargs)
+                reference_image.save(reference_path, **save_kwargs)
             finally:
                 target_image.close()
                 reference_image.close()
@@ -865,6 +986,10 @@ def main() -> None:
         del preprocess_metas
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        
+        # Clean up temporary rescaled images
+        if temp_resized_dir is not None and temp_resized_dir.exists():
+            shutil.rmtree(temp_resized_dir)
 
 
 if __name__ == "__main__":
