@@ -19,6 +19,16 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from hole_filling_renderer import HoleFillingRenderer
 
+try:
+    import cv2
+    import onnxruntime
+    from vggt.visual_util import segment_sky, download_file_from_url
+    SKY_FILTER_AVAILABLE = True
+except ImportError:
+    SKY_FILTER_AVAILABLE = False
+    cv2 = None
+    onnxruntime = None
+
 pillow_heif.register_heif_opener()
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
@@ -149,6 +159,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save point clouds as PLY files for the reference frames (default: off).",
     )
+    parser.add_argument(
+        "--filter-sky",
+        action="store_true",
+        help="Filter sky points using segmentation model (requires onnxruntime, default: off).",
+    )
+    parser.add_argument(
+        "--filter-black-bg",
+        action="store_true",
+        help="Filter black background points (RGB sum < 16, default: off).",
+    )
+    parser.add_argument(
+        "--filter-white-bg",
+        action="store_true",
+        help="Filter white background points (RGB > 240, default: off).",
+    )
     return parser.parse_args()
 
 
@@ -201,6 +226,66 @@ def write_ply(
                 # Add confidence as float
                 data += struct.pack('f', confidences[i])
             f.write(data)
+
+
+def apply_sky_filter(
+    conf_frame: np.ndarray,
+    image_path: Path,
+    skyseg_session,
+    sky_masks_dir: Path,
+) -> np.ndarray:
+    """Apply sky segmentation to filter confidence scores."""
+    if not SKY_FILTER_AVAILABLE:
+        print("Warning: Sky filtering requires opencv-python and onnxruntime. Skipping.")
+        return conf_frame
+    
+    sky_masks_dir.mkdir(parents=True, exist_ok=True)
+    image_name = image_path.name
+    mask_path = sky_masks_dir / image_name
+    
+    if mask_path.exists():
+        sky_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    else:
+        sky_mask = segment_sky(str(image_path), skyseg_session, str(mask_path))
+    
+    # Resize mask to match confidence map if needed
+    H, W = conf_frame.shape
+    if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
+        sky_mask = cv2.resize(sky_mask, (W, H))
+    
+    # Apply mask (segment_sky returns 255 for non-sky, 0 for sky)
+    sky_mask_binary = (sky_mask > 128).astype(np.float32)
+    return conf_frame * sky_mask_binary
+
+
+def apply_background_filters(
+    colors: np.ndarray,
+    filter_black: bool,
+    filter_white: bool,
+) -> np.ndarray:
+    """Apply black and/or white background filtering.
+    
+    Args:
+        colors: Nx3 array of RGB colors (0-1 range)
+        filter_black: Filter black background
+        filter_white: Filter white background
+    
+    Returns:
+        Boolean mask of valid points
+    """
+    mask = np.ones(colors.shape[0], dtype=bool)
+    
+    if filter_black:
+        # Filter out black background (RGB sum < 16/255 in 0-1 range)
+        colors_255 = (colors * 255).astype(np.uint8)
+        mask &= (colors_255.sum(axis=1) >= 16)
+    
+    if filter_white:
+        # Filter out white background (all RGB > 240/255)
+        colors_255 = (colors * 255).astype(np.uint8)
+        mask &= ~((colors_255[:, 0] > 240) & (colors_255[:, 1] > 240) & (colors_255[:, 2] > 240))
+    
+    return mask
 
 
 def sorted_image_paths(input_dir: Path, skip_every: int) -> list[Path]:
@@ -742,6 +827,23 @@ def main() -> None:
     renderer: HoleFillingRenderer | None = None
     renderer_size: tuple[int, int] | None = None
     shaders_dir = Path(__file__).resolve().parent / "shaders"
+    
+    # Initialize sky segmentation if needed
+    skyseg_session = None
+    if args.filter_sky:
+        if not SKY_FILTER_AVAILABLE:
+            print("Warning: --filter-sky requires opencv-python and onnxruntime. Install with:")
+            print("  uv pip install opencv-python onnxruntime")
+            print("Sky filtering will be disabled.")
+        else:
+            skyseg_path = Path("skyseg.onnx")
+            if not skyseg_path.exists():
+                print("Downloading sky segmentation model...")
+                download_file_from_url(
+                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
+                    "skyseg.onnx"
+                )
+            skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
 
     for scene_dir in scene_dirs:
         try:
@@ -935,11 +1037,28 @@ def main() -> None:
                 depth_frame = depth_frame.squeeze(-1)
             if conf_frame.ndim == 3:
                 conf_frame = conf_frame.squeeze(-1)
+            
+            # Apply sky filtering if enabled
+            if args.filter_sky and skyseg_session is not None:
+                sky_masks_dir = scene_output_dir / "sky_masks"
+                conf_frame = apply_sky_filter(
+                    conf_frame, image_paths[idx], skyseg_session, sky_masks_dir
+                )
+            
             valid_mask = depth_frame > 1e-6
 
             points = world_points[idx][valid_mask]
             colors = images_np[idx][valid_mask]
             confidences = conf_frame[valid_mask]
+            
+            # Apply background filtering if enabled
+            if args.filter_black_bg or args.filter_white_bg:
+                bg_mask = apply_background_filters(
+                    colors, args.filter_black_bg, args.filter_white_bg
+                )
+                points = points[bg_mask]
+                colors = colors[bg_mask]
+                confidences = confidences[bg_mask]
 
             if args.auto_s0:
                 s0 = estimate_s0_from_depth(depth_frame, intrinsic[idx])

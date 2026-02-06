@@ -63,6 +63,16 @@ Export point clouds for visualization:
 uv run python build_warp_dataset.py --upsample-depth --auto-s0 --save-ply
 ```
 
+Filter sky and background for cleaner point clouds:
+```bash
+uv run python build_warp_dataset.py --upsample-depth --auto-s0 --filter-sky --filter-black-bg
+```
+
+**Note**: `--filter-sky` requires additional dependencies:
+```bash
+uv pip install opencv-python onnxruntime
+```
+
 ## Command-Line Options
 
 ### Input/Output
@@ -87,6 +97,11 @@ uv run python build_warp_dataset.py --upsample-depth --auto-s0 --save-ply
 - `--auto-s0`: Automatically estimate per-frame Gaussian splat size (s0) from depth and intrinsics (disabled by default)
 - `--no-confidence`: Skip saving depth confidence maps (saves confidence by default)
 - `--save-ply`: Save point clouds as PLY files for reference frames (disabled by default). Creates viewable 3D point clouds with RGB colors and optional confidence values.
+
+### Point Cloud Filtering
+- `--filter-sky`: Filter sky points using semantic segmentation (disabled by default). Requires `opencv-python` and `onnxruntime`. Downloads skyseg.onnx model on first use.
+- `--filter-black-bg`: Filter black background points (RGB sum < 16, disabled by default). Useful for images with black borders or backgrounds.
+- `--filter-white-bg`: Filter white background points (RGB > 240, disabled by default). Useful for images with white backgrounds or overexposed regions.
 
 ### Frame Selection
 - `--skip-every <int>`: Use every Nth image to increase view spacing (default: 1, uses all images)
