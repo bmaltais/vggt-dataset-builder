@@ -56,9 +56,20 @@ def build_projection_matrix(
     proj[3, 2] = -1.0
     return proj
 
+def write_ply_basic(path, points, colors, confs):
+    header = f"ply\nformat binary_little_endian 1.0\nelement vertex {len(points)}\n"
+    header += "property float x\nproperty float y\nproperty float z\n"
+    header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+    header += "property float confidence\nend_header\n"
+    with open(path, 'wb') as f:
+        f.write(header.encode('ascii'))
+        colors_u8 = (colors * 255).astype(np.uint8)
+        for i in range(len(points)):
+            f.write(struct.pack('fffBBBf', *points[i], *colors_u8[i], confs[i]))
+
 class VGGT_Model_Inference:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "images": ("IMAGE",),
@@ -150,18 +161,6 @@ class VGGT_Model_Inference:
         ply_filename = f"vggt_temp_{temp_id}.ply"
         ply_path = os.path.join(output_dir, ply_filename)
 
-        # Reuse write_ply from build_warp_dataset.py logic
-        def write_ply_basic(path, points, colors, confs):
-            header = f"ply\nformat binary_little_endian 1.0\nelement vertex {len(points)}\n"
-            header += "property float x\nproperty float y\nproperty float z\n"
-            header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-            header += "property float confidence\nend_header\n"
-            with open(path, 'wb') as f:
-                f.write(header.encode('ascii'))
-                colors_u8 = (colors * 255).astype(np.uint8)
-                for i in range(len(points)):
-                    f.write(struct.pack('fffBBBf', *points[i], *colors_u8[i], confs[i]))
-
         write_ply_basic(ply_path, vggt_points["points"], vggt_points["colors"], vggt_points["confidences"])
         vggt_points["ply_path"] = ply_filename # ComfyUI prefers relative to output/input
 
@@ -169,7 +168,7 @@ class VGGT_Model_Inference:
 
 class VGGT_PLY_Loader:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "ply_path": ("STRING", {"default": "output/scene1/image2_reference.ply"}),
@@ -265,7 +264,7 @@ class VGGT_PLY_Loader:
 
 class VGGT_PLY_Viewer:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "vggt_points": ("VGGT_POINTS",),
@@ -297,14 +296,20 @@ class VGGT_PLY_Viewer:
             })
 
         if camera_state:
-            state = json.loads(camera_state)
-            view_mat = np.array(state["view_matrix"], dtype=np.float32).reshape(4, 4)
-            proj_mat = np.array(state["proj_matrix"], dtype=np.float32).reshape(4, 4)
-            fov_y = float(state["fov_y"])
-        elif all_cams:
-            view_mat = all_cams[0]["view_matrix"]
-            proj_mat = all_cams[0]["proj_matrix"]
-            fov_y = all_cams[0]["fov_y"]
+            try:
+                state = json.loads(camera_state)
+                view_mat = np.array(state["view_matrix"], dtype=np.float32).reshape(4, 4)
+                proj_mat = np.array(state["proj_matrix"], dtype=np.float32).reshape(4, 4)
+                fov_y = float(state["fov_y"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+                print(f"Warning: Invalid camera_state: {e}. Falling back to default.")
+                camera_state = None # Force fallback
+
+        if not camera_state:
+            if all_cams:
+                view_mat = all_cams[0]["view_matrix"]
+                proj_mat = all_cams[0]["proj_matrix"]
+                fov_y = all_cams[0]["fov_y"]
         else:
             # Default camera: look at the center of the point cloud
             points = vggt_points["points"]
@@ -339,7 +344,7 @@ class VGGT_PLY_Renderer:
         self.last_config = None
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "vggt_points": ("VGGT_POINTS",),
