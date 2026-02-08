@@ -23,7 +23,7 @@ class HoleFillingRenderer:
         self,
         width: int,
         height: int,
-        shaders_dir: Path,
+        shaders_dir: Path | None = None,
         confidence_threshold: float = 1.1,
         s0: float = 0.005,
         occlusion_threshold: float = 0.1,
@@ -41,7 +41,10 @@ class HoleFillingRenderer:
         self.ctx = moderngl.create_standalone_context(require=410)
         self.ctx.point_size = 1.0
 
-        shaders_dir = Path(shaders_dir)
+        if shaders_dir is None:
+            shaders_dir = Path(__file__).parent / "shaders"
+
+        shaders_dir = Path(shaders_dir).resolve()
         if not shaders_dir.exists():
             raise FileNotFoundError(f"Shaders directory not found: {shaders_dir}")
 
