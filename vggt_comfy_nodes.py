@@ -382,7 +382,7 @@ class VGGT_PLY_Renderer:
     def render(self, vggt_points, vggt_camera, width, height, confidence_threshold, sigma):
         # Use the directory of this file to find shaders
         shaders_dir = Path(__file__).parent / "shaders"
-        current_config = (width, height, str(shaders_dir))
+        current_config = (width, height)
 
         if self.renderer is None or self.last_config != current_config:
             self.renderer = HoleFillingRenderer(

@@ -153,7 +153,7 @@ app.registerExtension({
                             if (child.material) child.material.dispose();
                         });
                         pointsGroup.clear();
-                        
+
                         const material = new THREE.PointsMaterial({
                             size: 0.01,
                             vertexColors: geometry.attributes.color ? true : false
