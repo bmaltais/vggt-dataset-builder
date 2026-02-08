@@ -43,19 +43,39 @@ app.registerExtension({
                 container.style.borderRadius = "4px";
                 container.style.marginTop = "10px";
                 container.style.marginBottom = "10px";
+                container.style.overflow = "hidden";
 
 				this.addDOMWidget("3DViewer", "div", container);
 
-                this.initViewer(container, cameraStateWidget);
+                // Add a overlay for camera selection
+                const overlay = document.createElement("div");
+                overlay.style.position = "absolute";
+                overlay.style.top = "10px";
+                overlay.style.left = "10px";
+                overlay.style.color = "white";
+                overlay.style.background = "rgba(0,0,0,0.5)";
+                overlay.style.padding = "5px";
+                overlay.style.borderRadius = "4px";
+                overlay.style.fontSize = "12px";
+                overlay.style.pointerEvents = "none";
+                container.appendChild(overlay);
+
+                const cameraSelect = document.createElement("select");
+                cameraSelect.style.pointerEvents = "auto";
+                cameraSelect.style.marginTop = "5px";
+                cameraSelect.style.display = "none";
+                overlay.appendChild(document.createElement("div")).textContent = "Cameras:";
+                overlay.appendChild(cameraSelect);
+
+                this.initViewer(container, cameraStateWidget, cameraSelect);
 
 				return r;
 			};
 
-            nodeType.prototype.initViewer = async function(container, cameraStateWidget) {
+            nodeType.prototype.initViewer = async function(container, cameraStateWidget, cameraSelect) {
                 await ensureThree();
                 const THREE = window.THREE;
 
-                // Use ResizeObserver to handle container size changes
                 const renderer = new THREE.WebGLRenderer({ antialias: true });
                 renderer.setPixelRatio(window.devicePixelRatio);
                 container.appendChild(renderer.domElement);
@@ -72,8 +92,15 @@ app.registerExtension({
                 const pointsGroup = new THREE.Group();
                 scene.add(pointsGroup);
 
+                const camerasGroup = new THREE.Group();
+                scene.add(camerasGroup);
+
                 const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
                 scene.add(ambientLight);
+
+                const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+                directionalLight.position.set(1, 1, 1);
+                scene.add(directionalLight);
 
                 const animate = () => {
                     if (!this.preview_enabled) return;
@@ -91,7 +118,7 @@ app.registerExtension({
                     renderer.render(scene, camera);
 
                     // Update camera state widget
-                    if (cameraStateWidget) {
+                    if (cameraStateWidget && !this.snapping) {
                         const viewMatrix = camera.matrixWorldInverse.toArray();
                         const projMatrix = camera.projectionMatrix.toArray();
                         const fov_y = camera.fov * Math.PI / 180;
@@ -112,33 +139,99 @@ app.registerExtension({
                     const loader = new THREE.PLYLoader();
                     loader.load(url, (geometry) => {
                         pointsGroup.clear();
-
-                        // Check if geometry has colors
                         const material = new THREE.PointsMaterial({
                             size: 0.01,
                             vertexColors: geometry.attributes.color ? true : false
                         });
-
-                        if (!geometry.attributes.color) {
-                            material.color = new THREE.Color(0xffffff);
-                        }
+                        if (!geometry.attributes.color) material.color = new THREE.Color(0xffffff);
 
                         const points = new THREE.Points(geometry, material);
                         pointsGroup.add(points);
 
-                        // Center camera
                         geometry.computeBoundingSphere();
                         const center = geometry.boundingSphere.center;
                         const radius = geometry.boundingSphere.radius;
                         controls.target.copy(center);
-                        camera.position.set(center.x, center.y, center.z + radius * 2);
-                        camera.near = radius / 100;
-                        camera.far = radius * 100;
+                        if (!this.hasCameras) {
+                            camera.position.set(center.x, center.y, center.z + radius * 2);
+                            camera.lookAt(center);
+                        }
+                        camera.near = radius / 1000;
+                        camera.far = radius * 1000;
                         camera.updateProjectionMatrix();
                         controls.update();
-                    },
-                    (xhr) => { console.log((xhr.loaded / xhr.total * 100) + '% loaded'); },
-                    (error) => { console.error('An error happened', error); });
+                    });
+                };
+
+                this.visualizeCameras = (cameras) => {
+                    camerasGroup.clear();
+                    this.hasCameras = cameras.length > 0;
+
+                    cameraSelect.innerHTML = "";
+                    const defaultOption = document.createElement("option");
+                    defaultOption.textContent = "-- Select to Snap --";
+                    cameraSelect.appendChild(defaultOption);
+
+                    cameras.forEach((cam, index) => {
+                        const viewMatrix = new THREE.Matrix4().fromArray(cam.view_matrix);
+                        const projMatrix = new THREE.Matrix4().fromArray(cam.proj_matrix);
+
+                        const helperCamera = new THREE.PerspectiveCamera();
+                        helperCamera.projectionMatrix.copy(projMatrix);
+                        // viewMatrix is worldToCamera, so we need cameraToWorld
+                        helperCamera.matrixWorld.copy(viewMatrix.clone().invert());
+                        helperCamera.matrixWorldInverse.copy(viewMatrix);
+
+                        const helper = new THREE.CameraHelper(helperCamera);
+                        helper.setColors(new THREE.Color(0xff0000), new THREE.Color(0x00ff00), new THREE.Color(0x0000ff), new THREE.Color(0xffff00), new THREE.Color(0xff00ff));
+                        camerasGroup.add(helper);
+
+                        const option = document.createElement("option");
+                        option.value = index;
+                        option.textContent = `Camera ${index}`;
+                        cameraSelect.appendChild(option);
+                    });
+
+                    cameraSelect.style.display = cameras.length > 0 ? "block" : "none";
+
+                    cameraSelect.onchange = () => {
+                        const index = cameraSelect.value;
+                        if (index !== "" && cameras[index]) {
+                            const cam = cameras[index];
+                            const viewMatrix = new THREE.Matrix4().fromArray(cam.view_matrix);
+                            const cameraToWorld = viewMatrix.clone().invert();
+
+                            this.snapping = true;
+
+                            // Extract position and rotation from cameraToWorld
+                            const position = new THREE.Vector3();
+                            const quaternion = new THREE.Quaternion();
+                            const scale = new THREE.Vector3();
+                            cameraToWorld.decompose(position, quaternion, scale);
+
+                            camera.position.copy(position);
+                            camera.quaternion.copy(quaternion);
+                            camera.fov = cam.fov_y * 180 / Math.PI;
+                            camera.updateProjectionMatrix();
+
+                            // Set control target to something in front of the camera
+                            const target = new THREE.Vector3(0, 0, -1).applyQuaternion(quaternion).add(position);
+                            controls.target.copy(target);
+                            controls.update();
+
+                            this.snapping = false;
+
+                            // Force widget update
+                            if (cameraStateWidget) {
+                                const state = {
+                                    view_matrix: cam.view_matrix,
+                                    proj_matrix: cam.proj_matrix,
+                                    fov_y: cam.fov_y
+                                };
+                                cameraStateWidget.value = JSON.stringify(state);
+                            }
+                        }
+                    };
                 };
 
                 this.onRemoved = () => {
@@ -151,9 +244,11 @@ app.registerExtension({
             nodeType.prototype.onExecuted = function (message) {
                 onExecuted?.apply(this, arguments);
                 if (message?.ply_path) {
-                    // In ComfyUI, files from 'output' or 'input' are served via /view
                     const url = api.api_url("/view?filename=" + encodeURIComponent(message.ply_path) + "&type=output");
                     this.loadPLY(url);
+                }
+                if (message?.cameras) {
+                    this.visualizeCameras(message.cameras);
                 }
             };
 		}
