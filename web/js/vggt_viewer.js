@@ -67,7 +67,8 @@ app.registerExtension({
                 overlay.appendChild(document.createElement("div")).textContent = "Cameras:";
                 overlay.appendChild(cameraSelect);
 
-                this.initViewer(container, cameraStateWidget, cameraSelect);
+                // Store initialization promise
+                this.viewerInitialized = this.initViewer(container, cameraStateWidget, cameraSelect);
 
 				return r;
 			};
@@ -89,6 +90,23 @@ app.registerExtension({
                 const controls = new THREE.OrbitControls(camera, renderer.domElement);
                 controls.enableDamping = true;
 
+                // Update camera state widget only when camera changes
+                const updateCameraState = () => {
+                    if (cameraStateWidget && !this.snapping) {
+                        const viewMatrix = camera.matrixWorldInverse.toArray();
+                        const projMatrix = camera.projectionMatrix.toArray();
+                        const fov_y = camera.fov * Math.PI / 180;
+
+                        const state = {
+                            view_matrix: viewMatrix,
+                            proj_matrix: projMatrix,
+                            fov_y: fov_y
+                        };
+                        cameraStateWidget.value = JSON.stringify(state);
+                    }
+                };
+                controls.addEventListener('change', updateCameraState);
+
                 const pointsGroup = new THREE.Group();
                 scene.add(pointsGroup);
 
@@ -108,7 +126,8 @@ app.registerExtension({
 
                     const width = container.clientWidth;
                     const height = container.clientHeight;
-                    if (renderer.domElement.width !== width || renderer.domElement.height !== height) {
+                    const currentSize = renderer.getSize(new THREE.Vector2());
+                    if (currentSize.x !== width || currentSize.y !== height) {
                         renderer.setSize(width, height, false);
                         camera.aspect = width / height;
                         camera.updateProjectionMatrix();
@@ -116,20 +135,6 @@ app.registerExtension({
 
                     controls.update();
                     renderer.render(scene, camera);
-
-                    // Update camera state widget
-                    if (cameraStateWidget && !this.snapping) {
-                        const viewMatrix = camera.matrixWorldInverse.toArray();
-                        const projMatrix = camera.projectionMatrix.toArray();
-                        const fov_y = camera.fov * Math.PI / 180;
-
-                        const state = {
-                            view_matrix: viewMatrix,
-                            proj_matrix: projMatrix,
-                            fov_y: fov_y
-                        };
-                        cameraStateWidget.value = JSON.stringify(state);
-                    }
                 };
 
                 this.preview_enabled = true;
@@ -138,7 +143,13 @@ app.registerExtension({
                 this.loadPLY = (url) => {
                     const loader = new THREE.PLYLoader();
                     loader.load(url, (geometry) => {
+                        // Dispose old geometries and materials before clearing
+                        pointsGroup.children.forEach(child => {
+                            if (child.geometry) child.geometry.dispose();
+                            if (child.material) child.material.dispose();
+                        });
                         pointsGroup.clear();
+                        
                         const material = new THREE.PointsMaterial({
                             size: 0.01,
                             vertexColors: geometry.attributes.color ? true : false
@@ -236,18 +247,34 @@ app.registerExtension({
 
                 this.onRemoved = () => {
                     this.preview_enabled = false;
+                    // Dispose all geometries and materials
+                    pointsGroup.children.forEach(child => {
+                        if (child.geometry) child.geometry.dispose();
+                        if (child.material) child.material.dispose();
+                    });
+                    camerasGroup.children.forEach(child => {
+                        if (child.geometry) child.geometry.dispose();
+                        if (child.material) child.material.dispose();
+                    });
                     renderer.dispose();
+                    if (container.contains(renderer.domElement)) {
+                        container.removeChild(renderer.domElement);
+                    }
                 };
             };
 
             const onExecuted = nodeType.prototype.onExecuted;
-            nodeType.prototype.onExecuted = function (message) {
+            nodeType.prototype.onExecuted = async function (message) {
                 onExecuted?.apply(this, arguments);
-                if (message?.ply_path) {
+                // Wait for viewer initialization before calling loadPLY
+                if (this.viewerInitialized) {
+                    await this.viewerInitialized;
+                }
+                if (message?.ply_path && this.loadPLY) {
                     const url = api.api_url("/view?filename=" + encodeURIComponent(message.ply_path) + "&type=output");
                     this.loadPLY(url);
                 }
-                if (message?.cameras) {
+                if (message?.cameras && this.visualizeCameras) {
                     this.visualizeCameras(message.cameras);
                 }
             };
