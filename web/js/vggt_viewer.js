@@ -21,6 +21,10 @@ async function ensureThree() {
 
     threePromise = (async () => {
         try {
+            // NOTE: Loading from CDN for simplicity. For production use, consider:
+            // - Bundling these dependencies with the extension
+            // - Using subresource integrity (SRI) for security
+            // - Providing offline/air-gapped support
             // Using a specific version of Three.js that is compatible with the examples
             await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js");
             await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js");
