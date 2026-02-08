@@ -13,17 +13,30 @@ async function loadScript(url) {
 }
 
 let threeLoaded = false;
+let threePromise = null;
+
 async function ensureThree() {
     if (threeLoaded) return;
-    // NOTE: Loading from CDN for simplicity. For production use, consider:
-    // - Bundling these dependencies with the extension
-    // - Using subresource integrity (SRI) for security
-    // - Providing offline/air-gapped support
-    // Using a specific version of Three.js that is compatible with the examples
-    await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js");
-    await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js");
-    await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/PLYLoader.js");
-    threeLoaded = true;
+    if (threePromise) return threePromise;
+
+    threePromise = (async () => {
+        try {
+            // NOTE: Loading from CDN for simplicity. For production use, consider:
+            // - Bundling these dependencies with the extension
+            // - Using subresource integrity (SRI) for security
+            // - Providing offline/air-gapped support
+            // Using a specific version of Three.js that is compatible with the examples
+            await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js");
+            await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js");
+            await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/PLYLoader.js");
+            threeLoaded = true;
+        } catch (err) {
+            console.error("VGGT.Viewer: Failed to load Three.js dependencies from CDN.", err);
+            threePromise = null;
+            throw err;
+        }
+    })();
+    return threePromise;
 }
 
 app.registerExtension({
@@ -62,6 +75,7 @@ app.registerExtension({
                 overlay.style.borderRadius = "4px";
                 overlay.style.fontSize = "12px";
                 overlay.style.pointerEvents = "none";
+                overlay.style.zIndex = "10";
                 container.appendChild(overlay);
 
                 const cameraSelect = document.createElement("select");
@@ -71,8 +85,7 @@ app.registerExtension({
                 overlay.appendChild(document.createElement("div")).textContent = "Cameras:";
                 overlay.appendChild(cameraSelect);
 
-                // Store initialization promise
-                this.viewerInitialized = this.initViewer(container, cameraStateWidget, cameraSelect);
+                this.viewerInitPromise = this.initViewer(container, cameraStateWidget, cameraSelect);
 
 				return r;
 			};
@@ -94,23 +107,6 @@ app.registerExtension({
                 const controls = new THREE.OrbitControls(camera, renderer.domElement);
                 controls.enableDamping = true;
 
-                // Update camera state widget only when camera changes
-                const updateCameraState = () => {
-                    if (cameraStateWidget && !this.snapping) {
-                        const viewMatrix = camera.matrixWorldInverse.toArray();
-                        const projMatrix = camera.projectionMatrix.toArray();
-                        const fov_y = camera.fov * Math.PI / 180;
-
-                        const state = {
-                            view_matrix: viewMatrix,
-                            proj_matrix: projMatrix,
-                            fov_y: fov_y
-                        };
-                        cameraStateWidget.value = JSON.stringify(state);
-                    }
-                };
-                controls.addEventListener('change', updateCameraState);
-
                 const pointsGroup = new THREE.Group();
                 scene.add(pointsGroup);
 
@@ -124,14 +120,19 @@ app.registerExtension({
                 directionalLight.position.set(1, 1, 1);
                 scene.add(directionalLight);
 
+                let lastWidgetUpdate = 0;
+                const WIDGET_UPDATE_THROTTLE = 100; // ms
+
+                const size = new THREE.Vector2();
                 const animate = () => {
                     if (!this.preview_enabled) return;
                     requestAnimationFrame(animate);
 
                     const width = container.clientWidth;
                     const height = container.clientHeight;
-                    const currentSize = renderer.getSize(new THREE.Vector2());
-                    if (currentSize.x !== width || currentSize.y !== height) {
+                    renderer.getSize(size);
+
+                    if (size.x !== width || size.y !== height) {
                         renderer.setSize(width, height, false);
                         camera.aspect = width / height;
                         camera.updateProjectionMatrix();
@@ -139,6 +140,27 @@ app.registerExtension({
 
                     controls.update();
                     renderer.render(scene, camera);
+
+                    // Update camera state widget with throttling
+                    if (cameraStateWidget && !this.snapping) {
+                        const now = Date.now();
+                        if (now - lastWidgetUpdate > WIDGET_UPDATE_THROTTLE) {
+                            const viewMatrix = camera.matrixWorldInverse.toArray();
+                            const projMatrix = camera.projectionMatrix.toArray();
+                            const fov_y = camera.fov * Math.PI / 180;
+
+                            const state = {
+                                view_matrix: viewMatrix,
+                                proj_matrix: projMatrix,
+                                fov_y: fov_y
+                            };
+                            const stateStr = JSON.stringify(state);
+                            if (cameraStateWidget.value !== stateStr) {
+                                cameraStateWidget.value = stateStr;
+                            }
+                            lastWidgetUpdate = now;
+                        }
+                    }
                 };
 
                 this.preview_enabled = true;
@@ -147,10 +169,16 @@ app.registerExtension({
                 this.loadPLY = (url) => {
                     const loader = new THREE.PLYLoader();
                     loader.load(url, (geometry) => {
-                        // Dispose old geometries and materials before clearing
-                        pointsGroup.children.forEach(child => {
-                            if (child.geometry) child.geometry.dispose();
-                            if (child.material) child.material.dispose();
+                        // Dispose previous content
+                        pointsGroup.traverse((obj) => {
+                            if (obj.geometry) obj.geometry.dispose();
+                            if (obj.material) {
+                                if (Array.isArray(obj.material)) {
+                                    obj.material.forEach(m => m.dispose());
+                                } else {
+                                    obj.material.dispose();
+                                }
+                            }
                         });
                         pointsGroup.clear();
 
@@ -179,6 +207,16 @@ app.registerExtension({
                 };
 
                 this.visualizeCameras = (cameras) => {
+                    camerasGroup.traverse((obj) => {
+                        if (obj.geometry) obj.geometry.dispose();
+                        if (obj.material) {
+                            if (Array.isArray(obj.material)) {
+                                obj.material.forEach(m => m.dispose());
+                            } else {
+                                obj.material.dispose();
+                            }
+                        }
+                    });
                     camerasGroup.clear();
                     this.hasCameras = cameras.length > 0;
 
@@ -244,6 +282,7 @@ app.registerExtension({
                                     fov_y: cam.fov_y
                                 };
                                 cameraStateWidget.value = JSON.stringify(state);
+                                lastWidgetUpdate = Date.now();
                             }
                         }
                     };
@@ -251,34 +290,31 @@ app.registerExtension({
 
                 this.onRemoved = () => {
                     this.preview_enabled = false;
-                    // Dispose all geometries and materials
-                    pointsGroup.children.forEach(child => {
-                        if (child.geometry) child.geometry.dispose();
-                        if (child.material) child.material.dispose();
-                    });
-                    camerasGroup.children.forEach(child => {
-                        if (child.geometry) child.geometry.dispose();
-                        if (child.material) child.material.dispose();
+                    scene.traverse((obj) => {
+                        if (obj.geometry) obj.geometry.dispose();
+                        if (obj.material) {
+                            if (Array.isArray(obj.material)) {
+                                obj.material.forEach(m => m.dispose());
+                            } else {
+                                obj.material.dispose();
+                            }
+                        }
                     });
                     renderer.dispose();
-                    if (container.contains(renderer.domElement)) {
-                        container.removeChild(renderer.domElement);
-                    }
+                    renderer.domElement.remove();
                 };
             };
 
             const onExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = async function (message) {
                 onExecuted?.apply(this, arguments);
-                // Wait for viewer initialization before calling loadPLY
-                if (this.viewerInitialized) {
-                    await this.viewerInitialized;
-                }
-                if (message?.ply_path && this.loadPLY) {
+                if (this.viewerInitPromise) await this.viewerInitPromise;
+
+                if (message?.ply_path) {
                     const url = api.api_url("/view?filename=" + encodeURIComponent(message.ply_path) + "&type=output");
                     this.loadPLY(url);
                 }
-                if (message?.cameras && this.visualizeCameras) {
+                if (message?.cameras) {
                     this.visualizeCameras(message.cameras);
                 }
             };

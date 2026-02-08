@@ -56,6 +56,17 @@ def build_projection_matrix(
     proj[3, 2] = -1.0
     return proj
 
+def write_ply_basic(path, points, colors, confs):
+    header = f"ply\nformat binary_little_endian 1.0\nelement vertex {len(points)}\n"
+    header += "property float x\nproperty float y\nproperty float z\n"
+    header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+    header += "property float confidence\nend_header\n"
+    with open(path, 'wb') as f:
+        f.write(header.encode('ascii'))
+        colors_u8 = (colors * 255).astype(np.uint8)
+        for i in range(len(points)):
+            f.write(struct.pack('fffBBBf', *points[i], *colors_u8[i], confs[i]))
+
 class VGGT_Model_Inference:
     @classmethod
     def INPUT_TYPES(cls):
@@ -150,18 +161,6 @@ class VGGT_Model_Inference:
         ply_filename = f"vggt_temp_{temp_id}.ply"
         ply_path = os.path.join(output_dir, ply_filename)
 
-        # Reuse write_ply from build_warp_dataset.py logic
-        def write_ply_basic(path, points, colors, confs):
-            header = f"ply\nformat binary_little_endian 1.0\nelement vertex {len(points)}\n"
-            header += "property float x\nproperty float y\nproperty float z\n"
-            header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-            header += "property float confidence\nend_header\n"
-            with open(path, 'wb') as f:
-                f.write(header.encode('ascii'))
-                colors_u8 = (colors * 255).astype(np.uint8)
-                for i in range(len(points)):
-                    f.write(struct.pack('fffBBBf', *points[i], *colors_u8[i], confs[i]))
-
         write_ply_basic(ply_path, vggt_points["points"], vggt_points["colors"], vggt_points["confidences"])
         vggt_points["ply_path"] = ply_filename # ComfyUI prefers relative to output/input
 
@@ -191,22 +190,11 @@ class VGGT_PLY_Loader:
 
         with open(ply_path, "rb") as f:
             header = ""
-            num_points = None
             while "end_header" not in header:
-                line_bytes = f.readline()
-                if not line_bytes:
-                    raise ValueError(f"Unexpected EOF while reading PLY header: 'end_header' not found in file '{ply_path}'")
-                line = line_bytes.decode("ascii")
+                line = f.readline().decode("ascii")
                 header += line
                 if "element vertex" in line:
                     num_points = int(line.split()[-1])
-
-            if num_points is None:
-                raise ValueError(f"PLY header is missing required 'element vertex' line in file '{ply_path}'")
-
-            # Validate format
-            if "format binary_little_endian" not in header:
-                raise ValueError(f"PLY file must be in binary_little_endian format. File: '{ply_path}'")
 
             # Check for confidence property
             has_confidence = "property float confidence" in header
@@ -215,13 +203,6 @@ class VGGT_PLY_Loader:
             # fffBBB (12 + 3 = 15 bytes) or fffBBBf (15 + 4 = 19 bytes)
             point_size = 19 if has_confidence else 15
             data = f.read(num_points * point_size)
-
-            # Validate data length
-            if len(data) != num_points * point_size:
-                raise ValueError(
-                    f"PLY data size mismatch: expected {num_points * point_size} bytes, "
-                    f"got {len(data)} bytes in file '{ply_path}'"
-                )
 
             # Use numpy for faster loading if possible
             if has_confidence:
@@ -321,14 +302,14 @@ class VGGT_PLY_Viewer:
                 proj_mat = np.array(state["proj_matrix"], dtype=np.float32).reshape(4, 4)
                 fov_y = float(state["fov_y"])
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-                raise ValueError(
-                    "Invalid camera_state: expected JSON with keys "
-                    "'view_matrix', 'proj_matrix', and 'fov_y', with 4x4 matrices."
-                ) from e
-        elif all_cams:
-            view_mat = all_cams[0]["view_matrix"]
-            proj_mat = all_cams[0]["proj_matrix"]
-            fov_y = all_cams[0]["fov_y"]
+                print(f"Warning: Invalid camera_state: {e}. Falling back to default.")
+                camera_state = None # Force fallback
+
+        if not camera_state:
+            if all_cams:
+                view_mat = all_cams[0]["view_matrix"]
+                proj_mat = all_cams[0]["proj_matrix"]
+                fov_y = all_cams[0]["fov_y"]
         else:
             # Default camera: look at the center of the point cloud
             points = vggt_points["points"]
@@ -370,7 +351,7 @@ class VGGT_PLY_Renderer:
                 "vggt_camera": ("VGGT_CAMERA",),
                 "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
-                "confidence_threshold": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0}),
+                "confidence_threshold": ("FLOAT", {"default": 1.01, "min": 0.0, "max": 2.0}),
                 "sigma": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 100.0}),
             }
         }
@@ -380,21 +361,20 @@ class VGGT_PLY_Renderer:
     CATEGORY = "VGGT"
 
     def render(self, vggt_points, vggt_camera, width, height, confidence_threshold, sigma):
-        # Use the directory of this file to find shaders
-        shaders_dir = Path(__file__).parent / "shaders"
-        current_config = (width, height)
+        current_config = (width, height, confidence_threshold, sigma)
 
         if self.renderer is None or self.last_config != current_config:
+            # Use the directory of this file to find shaders
+            shaders_dir = Path(__file__).parent / "shaders"
+
             self.renderer = HoleFillingRenderer(
                 width=width,
                 height=height,
                 shaders_dir=shaders_dir,
+                confidence_threshold=confidence_threshold,
+                jfa_mask_sigma=sigma
             )
             self.last_config = current_config
-        
-        # Update confidence threshold and sigma (these can change without recreating renderer)
-        self.renderer.confidence_threshold = confidence_threshold
-        self.renderer.jfa_mask_sigma = sigma
 
         img = self.renderer.render(
             points=vggt_points["points"],
