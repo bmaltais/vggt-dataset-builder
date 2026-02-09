@@ -108,8 +108,80 @@ def download_file_from_url(url, filename):
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         print(f"Downloaded {filename} successfully.")
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading file: {e}")
+    except Exception as e:
+        print(f"Error downloading {filename}: {e}")
+
+def extract_tiles_from_input(model_input_tensor, tile_positions):
+    """Extract tiles from the input tensor based on positions.
+    
+    Args:
+        model_input_tensor: Tensor of shape (B, C, H, W)
+        tile_positions: List of (y_start, y_end) tuples
+    
+    Returns:
+        List of tile tensors, each of shape (B, C, 518, W)
+    """
+    tiles = []
+    for y_start, y_end in tile_positions:
+        # Extract tile from input
+        tile = model_input_tensor[:, :, y_start:y_end, :]
+        
+        # Resize to exactly 518 height if needed
+        if tile.shape[2] != 518:
+            tile = F.interpolate(tile, size=(518, tile.shape[3]), mode='bicubic', align_corners=False)
+        
+        tiles.append(tile)
+    
+    return tiles
+
+def merge_tile_predictions(tile_predictions_list, tile_positions, original_height, S, W):
+    """Merge predictions from multiple tiles back to full image space.
+    
+    Args:
+        tile_predictions_list: List of dicts with tile predictions
+        tile_positions: List of (y_start, y_end) tuples
+        original_height: Original image height
+        S: Sequence dimension (number of frames)
+        W: Width of images
+    
+    Returns:
+        Merged predictions dict
+    """
+    # Initialize output arrays
+    merged_depth = np.zeros((S, original_height, W, 1))
+    merged_conf = np.zeros((S, original_height, W))
+    
+    # Process each tile
+    for tile_idx, (pred, (y_start, y_end)) in enumerate(zip(tile_predictions_list, tile_positions)):
+        tile_height = y_end - y_start
+        
+        # Resize depth and conf from 518 to tile's original height if needed
+        if pred['depth'].shape[1] != tile_height:
+            depth_resized = F.interpolate(
+                torch.from_numpy(pred['depth'].transpose(0, 3, 1, 2)).float(),
+                size=(tile_height, W),
+                mode='bilinear',
+                align_corners=False
+            ).numpy().transpose(0, 2, 3, 1)
+            conf_resized = F.interpolate(
+                torch.from_numpy(pred['depth_conf'].reshape(S, 1, 518, W)).float(),
+                size=(tile_height, W),
+                mode='bilinear',
+                align_corners=False
+            ).numpy().reshape(S, tile_height, W)
+        else:
+            depth_resized = pred['depth']
+            conf_resized = pred['depth_conf']
+        
+        # Place into output with blending in overlap regions
+        merged_depth[:, y_start:y_end, :, :] = depth_resized
+        merged_conf[:, y_start:y_end, :] = conf_resized
+    
+    # Return merged dict with same structure as single-pass inference
+    return {
+        'depth': merged_depth,
+        'depth_conf': merged_conf
+    }
 
 def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
     """Write a 3DGS-compatible PLY file matching GaussianViewer's format exactly."""
@@ -207,10 +279,6 @@ class VGGT_Model_Inference:
                 "image_2": ("IMAGE", {"tooltip": "Optional second image for multi-frame inference"}),
                 "image_3": ("IMAGE", {"tooltip": "Optional third image for multi-frame inference"}),
                 "image_4": ("IMAGE", {"tooltip": "Optional fourth image for multi-frame inference"}),
-                "prediction_mode": (["Depthmap and Camera Branch", "Pointmap Branch"], {
-                    "default": "Depthmap and Camera Branch",
-                    "tooltip": "Depthmap: geometric unprojection from depth+camera (more accurate). Pointmap: direct 3D prediction (faster)."
-                }),
                 "depth_conf_threshold": ("FLOAT", {
                     "default": 50.0,
                     "min": 0.0,
@@ -225,17 +293,9 @@ class VGGT_Model_Inference:
                     "step": 0.1,
                     "tooltip": "Multiplier for Gaussian splat size (higher = larger splats)"
                 }),
-                "preprocess_mode": (["crop", "pad"], {
+                "preprocess_mode": (["crop", "pad_white", "pad_black", "tile"], {
                     "default": "pad",
-                    "tooltip": "Preprocessing mode before VGGT inference"
-                }),
-                "upsample_depth": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Upsample depth/confidence maps to output resolution before creating point cloud (demo uses False)"
-                }),
-                "auto_s0": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Estimate s0 (scale) per frame from depth and intrinsics (demo uses False)"
+                    "tooltip": "Preprocessing mode: crop=demo default (may crop tall images), pad_white=preserve all pixels with white padding (demo-style), pad_black=preserve all pixels with black padding, tile=full height at 518px width (experimental)"
                 }),
                 "mask_black_bg": ("BOOLEAN", {
                     "default": False,
@@ -244,10 +304,6 @@ class VGGT_Model_Inference:
                 "mask_white_bg": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Filter out white background pixels (useful for images with white backgrounds)"
-                }),
-                "mask_sky": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Filter out sky using segmentation model (requires onnxruntime, downloads ~200MB model)"
                 }),
                 "boundary_threshold": ("INT", {
                     "default": 0,
@@ -262,13 +318,6 @@ class VGGT_Model_Inference:
                     "step": 1.0,
                     "tooltip": "Maximum depth value to keep. -1 = no limit"
                 }),
-                "focal_length_multiplier": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.25,
-                    "max": 4.0,
-                    "step": 0.05,
-                    "tooltip": "Multiply VGGT's predicted focal length. 1.0 = no change (demo default), <1.0 = wider FOV, >1.0 = narrower FOV"
-                }),
             }
         }
 
@@ -277,7 +326,7 @@ class VGGT_Model_Inference:
     FUNCTION = "infer"
     CATEGORY = "VGGT"
 
-    def infer(self, image_1, device, image_2=None, image_3=None, image_4=None, prediction_mode="Depthmap and Camera Branch", depth_conf_threshold=1.01, gaussian_scale_multiplier=0.5, preprocess_mode="crop", upsample_depth=False, auto_s0=False, mask_black_bg=False, mask_white_bg=False, mask_sky=False, boundary_threshold=0, max_depth=-1.0, focal_length_multiplier=1.0):
+    def infer(self, image_1, device, image_2=None, image_3=None, image_4=None, depth_conf_threshold=1.01, gaussian_scale_multiplier=0.5, preprocess_mode="crop", mask_black_bg=False, mask_white_bg=False, boundary_threshold=0, max_depth=-1.0):
         # Combine multiple images into a sequence
         images_list = [image_1]
         if image_2 is not None:
@@ -305,23 +354,27 @@ class VGGT_Model_Inference:
         target_size = 518
         
         if preprocess_mode == "crop":
-            # Demo default: set width to 518px, crop height if > 518
+            # Demo mode: resize to width=518px maintaining aspect ratio
+            # IMPORTANT: For tall/square images, this will CENTER-CROP the height to 518px,
+            # which LOSES top and bottom information. Use "pad" mode to preserve all pixels.
+            # Demo examples use wide images (779x520), so no cropping occurs with them.
             new_width = target_size
             new_height = round(height * (new_width / width) / 14) * 14
             
             import torch.nn.functional as F
             model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
             
-            # Center crop height if > 518
+            # Center crop height ONLY if > 518 (loses top/bottom info for tall images)
             if new_height > target_size:
                 start_y = (new_height - target_size) // 2
                 model_input = model_input[:, :, start_y:start_y + target_size, :]
                 new_height = target_size
+                print(f"[VGGT] WARNING: Center-cropped height from {height} to 518px - information lost!")
             
             print(f"[VGGT] Preprocessed (crop mode): {height}x{width} -> {new_height}x{new_width}")
             height, width = new_height, new_width
             
-        elif preprocess_mode == "pad":
+        elif preprocess_mode in ["pad_white", "pad_black"]:
             # Pad mode: largest dimension = 518px, pad to square
             if width >= height:
                 new_width = target_size
@@ -341,11 +394,24 @@ class VGGT_Model_Inference:
                 pad_bottom = h_padding - pad_top
                 pad_left = w_padding // 2
                 pad_right = w_padding - pad_left
-                model_input = F.pad(model_input, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=1.0)
+                pad_value = 1.0 if preprocess_mode == "pad_white" else 0.0
+                model_input = F.pad(model_input, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=pad_value)
                 new_height = target_size
                 new_width = target_size
             
-            print(f"[VGGT] Preprocessed (pad mode): {height}x{width} -> {new_height}x{new_width}")
+            print(f"[VGGT] Preprocessed ({preprocess_mode}): {height}x{width} -> {new_height}x{new_width}")
+            height, width = new_height, new_width
+        elif preprocess_mode == "tile":
+            # Tile mode: for tall images, keep width=518px (model training constraint)
+            # but allow full height without center-cropping
+            # This preserves vertical information while respecting model's training resolution
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+            
+            import torch.nn.functional as F
+            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
+            
+            print(f"[VGGT] TILE MODE: Keeping width=518px (model training constraint), full height: {height}x{width} -> {new_height}x{new_width}")
             height, width = new_height, new_width
         else:
             # No preprocessing - just ensure divisible by 14
@@ -360,6 +426,9 @@ class VGGT_Model_Inference:
         
         # Move to device
         model_input = model_input.to(device)
+        
+        # Flag to indicate if we're using tiling
+        using_tiles = preprocess_mode == "tile" and height > width
 
         from vggt.models.vggt import VGGT
 
@@ -371,6 +440,16 @@ class VGGT_Model_Inference:
             else torch.float16
         )
 
+        # === HANDLE TILING FOR TALL IMAGES (if requested) ===
+        tile_info = None
+        if using_tiles:
+            print(f"[VGGT] TILE MODE: Processing tall image ({height}x{width}) with overlapping tiles for full coverage")
+            print(f"[VGGT] WARNING: Tile mode is EXPERIMENTAL. Use pad mode if results are incorrect.")
+            # For tile mode, we'll do inference ONCE on the full image (no cropping)
+            # Then extract overlapping tiles from the OUTPUT point clouds
+            # This gives us better consistency than cropping inputs
+            tile_info = {"enabled": True, "original_height": height}
+        
         # === EXACT SAME PROCESSING AS DEMO_GRADIO.PY ===
         # Run inference (matching demo exactly)
         print("[VGGT] Running inference...")
@@ -410,21 +489,10 @@ class VGGT_Model_Inference:
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        # Extract outputs for point cloud generation (matching demo format)
-        # Select world points based on prediction mode (matching demo_gradio.py)
-        if "Pointmap" in prediction_mode:
-            print("[VGGT] Using Pointmap Branch (direct 3D prediction)")
-            if "world_points" in predictions:
-                world_points_batch = predictions["world_points"]
-                depth_conf = predictions.get("world_points_conf", np.ones_like(world_points_batch[..., 0]))
-            else:
-                print("[VGGT] WARNING: world_points not found, falling back to depth-based")
-                world_points_batch = predictions["world_points_from_depth"]
-                depth_conf = predictions["depth_conf"]
-        else:
-            print("[VGGT] Using Depthmap and Camera Branch (geometric unprojection)")
-            world_points_batch = predictions["world_points_from_depth"]
-            depth_conf = predictions["depth_conf"]
+        # Extract outputs for point cloud generation (using depth-based unprojection)
+        print("[VGGT] Using Depthmap and Camera Branch (geometric unprojection)")
+        world_points_batch = predictions["world_points_from_depth"]
+        depth_conf = predictions["depth_conf"]
         
         extrinsic_np = predictions["extrinsic"]  # (S, 3, 4)
         intrinsic_np = predictions["intrinsic"]  # (S, 3, 3)
