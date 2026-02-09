@@ -52,7 +52,7 @@ This repo includes a ComfyUI node for running VGGT directly and exporting a Gaus
 - `device`: `cuda` or `cpu`.
 
 **Inputs (optional)**
-- `image_2`, `image_3`, `image_4`: Additional frames for multi-image inference (1–4 total).
+- `image_2`, `image_3`, `image_4`: Additional frames for multi-image inference (1–4 total). **All images are automatically resized to the same dimensions** before processing to handle different aspect ratios.
 - `depth_conf_threshold` (default: `50.0`): Percentile threshold for confidence filtering (0–100). Example: 50 keeps the top 50% of points.
 - `gaussian_scale_multiplier` (default: `0.1`): Splat size multiplier for the exported Gaussian PLY.
 - `preprocess_mode` (default: `pad_white`):
@@ -73,6 +73,29 @@ This repo includes a ComfyUI node for running VGGT directly and exporting a Gaus
 **Notes**
 - For the best alignment, `crop` usually matches the demo behavior most closely.
 - Use `pad_white`/`pad_black` when you need full image coverage (no cropping) at the cost of slightly less stable alignment.
+
+**Multi-Image Aspect Ratio Handling**
+
+The node automatically handles images with different aspect ratios when processing multiple frames (image_2, image_3, image_4):
+
+1. **Each image is preprocessed independently** based on its own aspect ratio
+2. **The first image sets the target dimensions** (based on the selected `preprocess_mode`)
+3. **All subsequent images are resized to match** those target dimensions
+4. **Then all images are concatenated** for batch processing
+
+This means you can safely pass images like:
+- Image 1: 1920x1440 (tall portrait)
+- Image 2: 1600x900 (landscape)  
+- Image 3: 2048x1536 (different ratio)
+
+The preprocessing will ensure they're all converted to the same size before being fed to the model, preventing "Sizes of tensors must match" errors.
+
+**Example**: With `preprocess_mode=pad_white`:
+- Image 1 (600x800): Resized to 392x518 (preserving aspect ratio)
+- Image 2 (400x800): Resized to 252x518
+- Image 3 (500x600): Resized to 434x518
+- All then resized to Image 1's target: 392x518
+- Then concatenated for inference
 
 ### Example Settings
 

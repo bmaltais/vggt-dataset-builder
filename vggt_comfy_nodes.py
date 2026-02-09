@@ -187,93 +187,55 @@ class VGGT_Model_Inference:
         if image_4 is not None:
             images_list.append(image_4)
         
-        # Concatenate images along batch dimension
-        if len(images_list) > 1:
-            # Stack them as a sequence: (B*S, H, W, C) -> will be handled as sequence
-            images = torch.cat(images_list, dim=0)
-            print(f"[VGGT] Processing {len(images_list)} images as sequence")
-        else:
-            images = image_1
+        # ===== KEY FIX: Preprocess each image individually with consistent output dimensions =====
+        # When images have different aspect ratios, we preprocess each one separately
+        # and ensure they all output the same dimensions before concatenation
         
-        # images is (S, H, W, C) or (B*S, H, W, C), range 0-1
-        batch_size, height, width, channels = images.shape
-
-        # Prepare images for model (B, C, H, W)
-        model_input = images.permute(0, 3, 1, 2)
-        
-        # Apply preprocessing to match demo_gradio.py (resize to 518px with proper aspect ratio)
+        import torch.nn.functional as F
         target_size = 518
         
-        if preprocess_mode == "crop":
-            # Demo mode: resize to width=518px maintaining aspect ratio
-            # IMPORTANT: For tall/square images, this will CENTER-CROP the height to 518px,
-            # which LOSES top and bottom information. Use "pad" mode to preserve all pixels.
-            # Demo examples use wide images (779x520), so no cropping occurs with them.
-            new_width = target_size
-            new_height = round(height * (new_width / width) / 14) * 14
+        if len(images_list) > 1:
+            print(f"[VGGT] Processing {len(images_list)} images as sequence")
+            # Preprocess each image separately first
+            processed_images = []
+            target_output_dims = None  # Will be set based on first image
             
-            import torch.nn.functional as F
-            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
+            for img_idx, img_tensor in enumerate(images_list):
+                batch_size, height, width, channels = img_tensor.shape
+                
+                # Convert to (B, C, H, W)
+                model_input = img_tensor.permute(0, 3, 1, 2)
+                
+                # Preprocess this specific image
+                model_input, out_height, out_width = self._preprocess_image_to_dims(
+                    model_input, height, width, target_size, preprocess_mode
+                )
+                
+                # Set target dimensions from first image
+                if target_output_dims is None:
+                    target_output_dims = (out_height, out_width)
+                    print(f"[VGGT] Target output dimensions: {out_height}x{out_width}")
+                else:
+                    # Resize this image to match first image's dimensions
+                    if (out_height, out_width) != target_output_dims:
+                        model_input = F.interpolate(
+                            model_input, size=target_output_dims, mode='bicubic', align_corners=False
+                        )
+                        print(f"[VGGT] Image {img_idx+1}: Resized from {out_height}x{out_width} to {target_output_dims[0]}x{target_output_dims[1]} for consistency")
+                
+                processed_images.append(model_input)
             
-            # Center crop height ONLY if > 518 (loses top/bottom info for tall images)
-            if new_height > target_size:
-                start_y = (new_height - target_size) // 2
-                model_input = model_input[:, :, start_y:start_y + target_size, :]
-                new_height = target_size
-                print(f"[VGGT] WARNING: Center-cropped height from {height} to 518px - information lost!")
-            
-            print(f"[VGGT] Preprocessed (crop mode): {height}x{width} -> {new_height}x{new_width}")
-            height, width = new_height, new_width
-            
-        elif preprocess_mode in ["pad_white", "pad_black"]:
-            # Pad mode: largest dimension = 518px, pad to square
-            if width >= height:
-                new_width = target_size
-                new_height = round(height * (new_width / width) / 14) * 14
-            else:
-                new_height = target_size
-                new_width = round(width * (new_height / height) / 14) * 14
-            
-            import torch.nn.functional as F
-            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
-            
-            # Pad to square if needed
-            h_padding = target_size - new_height
-            w_padding = target_size - new_width
-            if h_padding > 0 or w_padding > 0:
-                pad_top = h_padding // 2
-                pad_bottom = h_padding - pad_top
-                pad_left = w_padding // 2
-                pad_right = w_padding - pad_left
-                pad_value = 1.0 if preprocess_mode == "pad_white" else 0.0
-                model_input = F.pad(model_input, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=pad_value)
-                new_height = target_size
-                new_width = target_size
-            
-            print(f"[VGGT] Preprocessed ({preprocess_mode}): {height}x{width} -> {new_height}x{new_width}")
-            height, width = new_height, new_width
-        elif preprocess_mode == "tile":
-            # Tile mode: for tall images, keep width=518px (model training constraint)
-            # but allow full height without center-cropping
-            # This preserves vertical information while respecting model's training resolution
-            new_width = target_size
-            new_height = round(height * (new_width / width) / 14) * 14
-            
-            import torch.nn.functional as F
-            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
-            
-            print(f"[VGGT] TILE MODE: Keeping width=518px (model training constraint), full height: {height}x{width} -> {new_height}x{new_width}")
-            height, width = new_height, new_width
+            # Now concatenate all images with consistent dimensions
+            model_input = torch.cat(processed_images, dim=0)
+            height, width = target_output_dims
+            batch_size = len(images_list)
         else:
-            # No preprocessing - just ensure divisible by 14
-            target_height = round(height / 14) * 14
-            target_width = round(width / 14) * 14
-            
-            if target_height != height or target_width != width:
-                import torch.nn.functional as F
-                model_input = F.interpolate(model_input, size=(target_height, target_width), mode='bicubic', align_corners=False)
-                print(f"[VGGT] Resized to nearest 14x multiple: {height}x{width} -> {target_height}x{target_width}")
-                height, width = target_height, target_width
+            # Single image
+            batch_size, height, width, channels = image_1.shape
+            model_input = image_1.permute(0, 3, 1, 2)
+            model_input, height, width = self._preprocess_image_to_dims(
+                model_input, height, width, target_size, preprocess_mode
+            )
         
         # Move to device
         model_input = model_input.to(device)
@@ -477,3 +439,69 @@ class VGGT_Model_Inference:
             print(f"[VGGT]     {row}")
 
         return (ply_path, first_extrinsics, first_intrinsics)
+
+    def _preprocess_image_to_dims(self, model_input, height, width, target_size, preprocess_mode):
+        """Preprocess a single image tensor. Returns (preprocessed_tensor, output_height, output_width)"""
+        import torch.nn.functional as F
+        
+        if preprocess_mode == "crop":
+            # Demo mode: resize to width=518px maintaining aspect ratio
+            # IMPORTANT: For tall/square images, this will CENTER-CROP the height to 518px,
+            # which LOSES top and bottom information. Use "pad" mode to preserve all pixels.
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+            
+            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
+            
+            # Center crop height ONLY if > 518 (loses top/bottom info for tall images)
+            if new_height > target_size:
+                start_y = (new_height - target_size) // 2
+                model_input = model_input[:, :, start_y:start_y + target_size, :]
+                new_height = target_size
+            
+            return model_input, new_height, new_width
+            
+        elif preprocess_mode in ["pad_white", "pad_black"]:
+            # Pad mode: largest dimension = 518px, pad to square
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14
+            
+            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
+            
+            # Pad to square if needed
+            h_padding = target_size - new_height
+            w_padding = target_size - new_width
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                pad_value = 1.0 if preprocess_mode == "pad_white" else 0.0
+                model_input = F.pad(model_input, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=pad_value)
+                new_height = target_size
+                new_width = target_size
+            
+            return model_input, new_height, new_width
+            
+        elif preprocess_mode == "tile":
+            # Tile mode: for tall images, keep width=518px (model training constraint)
+            # but allow full height without center-cropping
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+            
+            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
+            
+            return model_input, new_height, new_width
+        else:
+            # No preprocessing - just ensure divisible by 14
+            target_height = round(height / 14) * 14
+            target_width = round(width / 14) * 14
+            
+            if target_height != height or target_width != width:
+                model_input = F.interpolate(model_input, size=(target_height, target_width), mode='bicubic', align_corners=False)
+            
+            return model_input, target_height, target_width
