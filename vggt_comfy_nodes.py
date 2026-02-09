@@ -230,12 +230,12 @@ class VGGT_Model_Inference:
                     "tooltip": "Preprocessing mode before VGGT inference"
                 }),
                 "upsample_depth": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Upsample depth/confidence maps to output resolution before creating point cloud"
+                    "default": False,
+                    "tooltip": "Upsample depth/confidence maps to output resolution before creating point cloud (demo uses False)"
                 }),
                 "auto_s0": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Estimate s0 (scale) per frame from depth and intrinsics"
+                    "default": False,
+                    "tooltip": "Estimate s0 (scale) per frame from depth and intrinsics (demo uses False)"
                 }),
                 "mask_black_bg": ("BOOLEAN", {
                     "default": False,
@@ -263,11 +263,11 @@ class VGGT_Model_Inference:
                     "tooltip": "Maximum depth value to keep. -1 = no limit"
                 }),
                 "focal_length_multiplier": ("FLOAT", {
-                    "default": 0.5,
+                    "default": 1.0,
                     "min": 0.25,
                     "max": 4.0,
                     "step": 0.05,
-                    "tooltip": "Multiply VGGT's predicted focal length. <1.0 = wider FOV, >1.0 = narrower FOV"
+                    "tooltip": "Multiply VGGT's predicted focal length. 1.0 = no change (demo default), <1.0 = wider FOV, >1.0 = narrower FOV"
                 }),
             }
         }
