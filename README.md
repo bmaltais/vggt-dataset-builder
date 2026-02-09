@@ -41,6 +41,39 @@ Run the dataset builder:
 uv run python build_warp_dataset.py
 ```
 
+## ComfyUI Node (VGGT Model Inference)
+
+This repo includes a ComfyUI node for running VGGT directly and exporting a GaussianViewer-compatible PLY plus camera matrices.
+
+**Node name:** `VGGT Model Inference`
+
+**Inputs (required)**
+- `image_1`: Primary input image.
+- `device`: `cuda` or `cpu`.
+
+**Inputs (optional)**
+- `image_2`, `image_3`, `image_4`: Additional frames for multi-image inference (1–4 total).
+- `depth_conf_threshold` (default: `50.0`): Percentile threshold for confidence filtering (0–100). Example: 50 keeps the top 50% of points.
+- `gaussian_scale_multiplier` (default: `0.1`): Splat size multiplier for the exported Gaussian PLY.
+- `preprocess_mode` (default: `pad_white`):
+  - `crop`: Demo-style resize to width=518 and center-crop height if needed (can lose top/bottom on tall images).
+  - `pad_white`: Preserve all pixels; pad to square with white borders (demo-style padding).
+  - `pad_black`: Preserve all pixels; pad to square with black borders.
+  - `tile`: Keep width=518 and full height (no crop); experimental for tall images.
+- `mask_black_bg` (default: `false`): Filter black background pixels (RGB sum < 16).
+- `mask_white_bg` (default: `false`): Filter white background pixels (RGB > 240).
+- `boundary_threshold` (default: `0`): Exclude points within N pixels of the image boundary.
+- `max_depth` (default: `-1`): Max depth distance; `-1` disables the filter.
+
+**Outputs**
+- `ply_path`: Path to the exported PLY (GaussianViewer compatible).
+- `extrinsics`: First camera extrinsic matrix (3×4).
+- `intrinsics`: First camera intrinsic matrix (3×3).
+
+**Notes**
+- For the best alignment, `crop` usually matches the demo behavior most closely.
+- Use `pad_white`/`pad_black` when you need full image coverage (no cropping) at the cost of slightly less stable alignment.
+
 ### Example Settings
 
 Basic usage with memory constraints:

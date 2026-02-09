@@ -1,26 +1,9 @@
 import os
-import struct
 import numpy as np
 import torch
 import torch.nn.functional as F
 import sys
-import base64
-import copy
-import requests
-try:
-    from .hole_filling_renderer import HoleFillingRenderer
-except ImportError:
-    from hole_filling_renderer import HoleFillingRenderer
 from pathlib import Path
-import json
-from folder_paths import get_output_directory
-
-# Try to import cv2 (optional, for sky segmentation)
-try:
-    import cv2
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
 
 # Add vggt to path
 vggt_path = str(Path(__file__).parent / "vggt")
@@ -50,138 +33,6 @@ def get_vggt_model(device_name):
         _vggt_model_device = device_name
     
     return _vggt_model
-
-# ============================================================================
-# CUSTOM UTILITY FUNCTIONS
-# ============================================================================
-
-# Sky segmentation utilities (custom implementation)
-def run_skyseg(onnx_session, input_size, image):
-    """Run sky segmentation inference using ONNX model."""
-    temp_image = copy.deepcopy(image)
-    resize_image = cv2.resize(temp_image, dsize=(input_size[0], input_size[1]))
-    x = cv2.cvtColor(resize_image, cv2.COLOR_BGR2RGB)
-    x = np.array(x, dtype=np.float32)
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-    x = (x / 255 - mean) / std
-    x = x.transpose(2, 0, 1)
-    x = x.reshape(-1, 3, input_size[0], input_size[1]).astype("float32")
-    input_name = onnx_session.get_inputs()[0].name
-    output_name = onnx_session.get_outputs()[0].name
-    onnx_result = onnx_session.run([output_name], {input_name: x})
-    onnx_result = np.array(onnx_result).squeeze()
-    min_value = np.min(onnx_result)
-    max_value = np.max(onnx_result)
-    onnx_result = (onnx_result - min_value) / (max_value - min_value)
-    onnx_result *= 255
-    onnx_result = onnx_result.astype("uint8")
-    return onnx_result
-
-def segment_sky(image_path, onnx_session, mask_filename=None):
-    """Segment sky from image using ONNX model."""
-    if not HAS_CV2:
-        raise ImportError("cv2 required for sky segmentation")
-    image = cv2.imread(image_path)
-    result_map = run_skyseg(onnx_session, [320, 320], image)
-    result_map_original = cv2.resize(result_map, (image.shape[1], image.shape[0]))
-    output_mask = np.zeros_like(result_map_original)
-    output_mask[result_map_original < 32] = 255
-    if mask_filename is not None:
-        os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
-        cv2.imwrite(mask_filename, output_mask)
-    return output_mask
-
-def download_file_from_url(url, filename):
-    """Download file from URL with redirect handling."""
-    try:
-        response = requests.get(url, allow_redirects=False)
-        response.raise_for_status()
-        if response.status_code == 302:
-            redirect_url = response.headers["Location"]
-            response = requests.get(redirect_url, stream=True)
-            response.raise_for_status()
-        else:
-            print(f"Unexpected status code: {response.status_code}")
-            return
-        with open(filename, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"Downloaded {filename} successfully.")
-    except Exception as e:
-        print(f"Error downloading {filename}: {e}")
-
-def extract_tiles_from_input(model_input_tensor, tile_positions):
-    """Extract tiles from the input tensor based on positions.
-    
-    Args:
-        model_input_tensor: Tensor of shape (B, C, H, W)
-        tile_positions: List of (y_start, y_end) tuples
-    
-    Returns:
-        List of tile tensors, each of shape (B, C, 518, W)
-    """
-    tiles = []
-    for y_start, y_end in tile_positions:
-        # Extract tile from input
-        tile = model_input_tensor[:, :, y_start:y_end, :]
-        
-        # Resize to exactly 518 height if needed
-        if tile.shape[2] != 518:
-            tile = F.interpolate(tile, size=(518, tile.shape[3]), mode='bicubic', align_corners=False)
-        
-        tiles.append(tile)
-    
-    return tiles
-
-def merge_tile_predictions(tile_predictions_list, tile_positions, original_height, S, W):
-    """Merge predictions from multiple tiles back to full image space.
-    
-    Args:
-        tile_predictions_list: List of dicts with tile predictions
-        tile_positions: List of (y_start, y_end) tuples
-        original_height: Original image height
-        S: Sequence dimension (number of frames)
-        W: Width of images
-    
-    Returns:
-        Merged predictions dict
-    """
-    # Initialize output arrays
-    merged_depth = np.zeros((S, original_height, W, 1))
-    merged_conf = np.zeros((S, original_height, W))
-    
-    # Process each tile
-    for tile_idx, (pred, (y_start, y_end)) in enumerate(zip(tile_predictions_list, tile_positions)):
-        tile_height = y_end - y_start
-        
-        # Resize depth and conf from 518 to tile's original height if needed
-        if pred['depth'].shape[1] != tile_height:
-            depth_resized = F.interpolate(
-                torch.from_numpy(pred['depth'].transpose(0, 3, 1, 2)).float(),
-                size=(tile_height, W),
-                mode='bilinear',
-                align_corners=False
-            ).numpy().transpose(0, 2, 3, 1)
-            conf_resized = F.interpolate(
-                torch.from_numpy(pred['depth_conf'].reshape(S, 1, 518, W)).float(),
-                size=(tile_height, W),
-                mode='bilinear',
-                align_corners=False
-            ).numpy().reshape(S, tile_height, W)
-        else:
-            depth_resized = pred['depth']
-            conf_resized = pred['depth_conf']
-        
-        # Place into output with blending in overlap regions
-        merged_depth[:, y_start:y_end, :, :] = depth_resized
-        merged_conf[:, y_start:y_end, :] = conf_resized
-    
-    # Return merged dict with same structure as single-pass inference
-    return {
-        'depth': merged_depth,
-        'depth_conf': merged_conf
-    }
 
 def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
     """Write a 3DGS-compatible PLY file matching GaussianViewer's format exactly."""
@@ -294,7 +145,7 @@ class VGGT_Model_Inference:
                     "tooltip": "Multiplier for Gaussian splat size (higher = larger splats)"
                 }),
                 "preprocess_mode": (["crop", "pad_white", "pad_black", "tile"], {
-                    "default": "pad",
+                    "default": "pad_white",
                     "tooltip": "Preprocessing mode: crop=demo default (may crop tall images), pad_white=preserve all pixels with white padding (demo-style), pad_black=preserve all pixels with black padding, tile=full height at 518px width (experimental)"
                 }),
                 "mask_black_bg": ("BOOLEAN", {
@@ -326,7 +177,7 @@ class VGGT_Model_Inference:
     FUNCTION = "infer"
     CATEGORY = "VGGT"
 
-    def infer(self, image_1, device, image_2=None, image_3=None, image_4=None, depth_conf_threshold=1.01, gaussian_scale_multiplier=0.5, preprocess_mode="crop", mask_black_bg=False, mask_white_bg=False, boundary_threshold=0, max_depth=-1.0):
+    def infer(self, image_1, device, image_2=None, image_3=None, image_4=None, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, boundary_threshold=0, max_depth=-1.0):
         # Combine multiple images into a sequence
         images_list = [image_1]
         if image_2 is not None:
