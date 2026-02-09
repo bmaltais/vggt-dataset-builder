@@ -2,94 +2,366 @@ import os
 import struct
 import numpy as np
 import torch
+import torch.nn.functional as F
 import sys
+import base64
+import copy
+import requests
 try:
     from .hole_filling_renderer import HoleFillingRenderer
 except ImportError:
     from hole_filling_renderer import HoleFillingRenderer
 from pathlib import Path
 import json
+from folder_paths import get_output_directory
+
+# Try to import cv2 (optional, for sky segmentation)
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 
 # Add vggt to path
 vggt_path = str(Path(__file__).parent / "vggt")
 if vggt_path not in sys.path:
     sys.path.insert(0, vggt_path)
 
+# Import VGGT utilities
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.geometry import unproject_depth_map_to_point_map
+
 # Lazy loading of VGGT model
 _vggt_model = None
+_vggt_model_device = None
 
 def get_vggt_model(device_name):
-    global _vggt_model
+    global _vggt_model, _vggt_model_device
+    from vggt.models.vggt import VGGT
+    device = torch.device(device_name)
+    
     if _vggt_model is None:
-        from vggt.models.vggt import VGGT
-        device = torch.device(device_name)
-        _vggt_model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+        _vggt_model = VGGT.from_pretrained("facebook/VGGT-1B")
         _vggt_model.eval()
+    
+    # Move model to the requested device if it's not already there
+    if _vggt_model_device != device_name:
+        _vggt_model = _vggt_model.to(device)
+        _vggt_model_device = device_name
+    
     return _vggt_model
 
-def build_view_matrix(extrinsic: np.ndarray) -> np.ndarray:
-    view = np.eye(4, dtype=np.float32)
-    view[:3, :3] = extrinsic[:3, :3]
-    view[:3, 3] = extrinsic[:3, 3]
-    conversion = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
-    return conversion @ view
+# ============================================================================
+# CUSTOM UTILITY FUNCTIONS
+# ============================================================================
 
-def build_projection_matrix(
-    intrinsic: np.ndarray,
-    width: int,
-    height: int,
-    near: float = 0.01,
-    far: float = 1000.0,
-) -> np.ndarray:
-    fx = intrinsic[0, 0]
-    fy = intrinsic[1, 1]
-    cx = intrinsic[0, 2]
-    cy = intrinsic[1, 2]
+# Sky segmentation utilities (custom implementation)
+def run_skyseg(onnx_session, input_size, image):
+    """Run sky segmentation inference using ONNX model."""
+    temp_image = copy.deepcopy(image)
+    resize_image = cv2.resize(temp_image, dsize=(input_size[0], input_size[1]))
+    x = cv2.cvtColor(resize_image, cv2.COLOR_BGR2RGB)
+    x = np.array(x, dtype=np.float32)
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    x = (x / 255 - mean) / std
+    x = x.transpose(2, 0, 1)
+    x = x.reshape(-1, 3, input_size[0], input_size[1]).astype("float32")
+    input_name = onnx_session.get_inputs()[0].name
+    output_name = onnx_session.get_outputs()[0].name
+    onnx_result = onnx_session.run([output_name], {input_name: x})
+    onnx_result = np.array(onnx_result).squeeze()
+    min_value = np.min(onnx_result)
+    max_value = np.max(onnx_result)
+    onnx_result = (onnx_result - min_value) / (max_value - min_value)
+    onnx_result *= 255
+    onnx_result = onnx_result.astype("uint8")
+    return onnx_result
 
-    proj = np.zeros((4, 4), dtype=np.float32)
-    proj[0, 0] = 2.0 * fx / width
-    proj[1, 1] = 2.0 * fy / height
-    proj[0, 2] = 2.0 * cx / width - 1.0
-    proj[1, 2] = 1.0 - 2.0 * cy / height
-    proj[2, 2] = -(far + near) / (far - near)
-    proj[2, 3] = -(2.0 * far * near) / (far - near)
-    proj[3, 2] = -1.0
-    return proj
+def segment_sky(image_path, onnx_session, mask_filename=None):
+    """Segment sky from image using ONNX model."""
+    if not HAS_CV2:
+        raise ImportError("cv2 required for sky segmentation")
+    image = cv2.imread(image_path)
+    result_map = run_skyseg(onnx_session, [320, 320], image)
+    result_map_original = cv2.resize(result_map, (image.shape[1], image.shape[0]))
+    output_mask = np.zeros_like(result_map_original)
+    output_mask[result_map_original < 32] = 255
+    if mask_filename is not None:
+        os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
+        cv2.imwrite(mask_filename, output_mask)
+    return output_mask
 
-def write_ply_basic(path, points, colors, confs):
-    header = f"ply\nformat binary_little_endian 1.0\nelement vertex {len(points)}\n"
-    header += "property float x\nproperty float y\nproperty float z\n"
-    header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-    header += "property float confidence\nend_header\n"
-    with open(path, 'wb') as f:
-        f.write(header.encode('ascii'))
-        colors_u8 = (colors * 255).astype(np.uint8)
-        for i in range(len(points)):
-            f.write(struct.pack('fffBBBf', *points[i], *colors_u8[i], confs[i]))
+def download_file_from_url(url, filename):
+    """Download file from URL with redirect handling."""
+    try:
+        response = requests.get(url, allow_redirects=False)
+        response.raise_for_status()
+        if response.status_code == 302:
+            redirect_url = response.headers["Location"]
+            response = requests.get(redirect_url, stream=True)
+            response.raise_for_status()
+        else:
+            print(f"Unexpected status code: {response.status_code}")
+            return
+        with open(filename, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"Downloaded {filename} successfully.")
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading file: {e}")
+
+def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
+    """Write a 3DGS-compatible PLY file matching GaussianViewer's format exactly."""
+    import numpy as np
+    from plyfile import PlyElement, PlyData
+    
+    n_points = len(points)
+    
+    # Clamp colors to [0, 1] range
+    colors_float = np.clip(colors, 0.0, 1.0).astype(np.float32)
+    
+    # Convert colors to spherical harmonics DC component
+    # GaussianViewer uses: rgb = (0.5 + SH_C0 * coeff) * 255
+    # So reverse: coeff = (rgb/255 - 0.5) / SH_C0
+    # SH_C0 = sqrt(1 / (4 * pi)) ≈ 0.28209479177387814
+    SH_C0 = 0.28209479177387814
+    sh_dc = (colors_float - 0.5) / SH_C0
+    
+    # Compute reasonable scales based on point density
+    points_min = points.min(axis=0)
+    points_max = points.max(axis=0)
+    scene_size = np.linalg.norm(points_max - points_min)
+    
+    # Average distance between points (rough estimate)
+    if n_points > 1:
+        avg_point_distance = scene_size / (n_points ** (1/3))
+    else:
+        avg_point_distance = 0.1
+    
+    # Create per-point scales
+    point_scales = np.ones((n_points, 3), dtype=np.float32) * avg_point_distance * scale_multiplier
+    scales = np.log(point_scales)
+    
+    # Default quaternion (identity rotation) for all points
+    quaternions = np.tile([1.0, 0.0, 0.0, 0.0], (n_points, 1)).astype(np.float32)
+    
+    # Convert opacity to logits using inverse sigmoid
+    # Clamp confidences to valid range
+    confs_safe = np.clip(confs, 1e-7, 1.0 - 1e-7).astype(np.float32)
+    opacity_logits = np.log(confs_safe / (1.0 - confs_safe))
+    
+    print(f"[PLY Writer] SH conversion debug:")
+    print(f"  Input colors range: [{colors_float.min():.4f}, {colors_float.max():.4f}]")
+    print(f"  SH_C0 constant: {SH_C0:.10f}")
+    print(f"  SH_DC range: [{sh_dc.min():.4f}, {sh_dc.max():.4f}]")
+    print(f"  Opacity logits range: [{opacity_logits.min():.4f}, {opacity_logits.max():.4f}]")
+    print(f"  Scales range: [{scales.min():.4f}, {scales.max():.4f}]")
+    
+    # Build dtype matching GaussianViewer's PLY format
+    dtype_full = [
+        ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+        ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'),
+        ('opacity', 'f4'),
+        ('scale_0', 'f4'), ('scale_1', 'f4'), ('scale_2', 'f4'),
+        ('rot_0', 'f4'), ('rot_1', 'f4'), ('rot_2', 'f4'), ('rot_3', 'f4'),
+    ]
+    
+    # Create structured array
+    elements = np.zeros(n_points, dtype=dtype_full)
+    elements['x'] = points[:, 0]
+    elements['y'] = points[:, 1]
+    elements['z'] = points[:, 2]
+    elements['f_dc_0'] = sh_dc[:, 0]
+    elements['f_dc_1'] = sh_dc[:, 1]
+    elements['f_dc_2'] = sh_dc[:, 2]
+    elements['opacity'] = opacity_logits
+    elements['scale_0'] = scales[:, 0]
+    elements['scale_1'] = scales[:, 1]
+    elements['scale_2'] = scales[:, 2]
+    elements['rot_0'] = quaternions[:, 0]
+    elements['rot_1'] = quaternions[:, 1]
+    elements['rot_2'] = quaternions[:, 2]
+    elements['rot_3'] = quaternions[:, 3]
+    
+    # Write PLY file using plyfile
+    vertex_element = PlyElement.describe(elements, 'vertex')
+    plydata = PlyData([vertex_element])
+    plydata.write(path)
+    
+    # Debug output
+    print(f"[PLY Writer] Wrote {n_points} Gaussians")
+    print(f"[PLY Writer] Scene size: {scene_size:.3f}, avg point distance: {avg_point_distance:.6f}")
+    print(f"[PLY Writer] Scale range (log space): [{scales.min():.3f}, {scales.max():.3f}]")
+    print(f"[PLY Writer] Opacity logits range: [{opacity_logits.min():.3f}, {opacity_logits.max():.3f}]")
 
 class VGGT_Model_Inference:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
+                "image_1": ("IMAGE",),
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
+            },
+            "optional": {
+                "image_2": ("IMAGE", {"tooltip": "Optional second image for multi-frame inference"}),
+                "image_3": ("IMAGE", {"tooltip": "Optional third image for multi-frame inference"}),
+                "image_4": ("IMAGE", {"tooltip": "Optional fourth image for multi-frame inference"}),
+                "prediction_mode": (["Depthmap and Camera Branch", "Pointmap Branch"], {
+                    "default": "Depthmap and Camera Branch",
+                    "tooltip": "Depthmap: geometric unprojection from depth+camera (more accurate). Pointmap: direct 3D prediction (faster)."
+                }),
+                "depth_conf_threshold": ("FLOAT", {
+                    "default": 50.0,
+                    "min": 0.0,
+                    "max": 100.0,
+                    "step": 0.1,
+                    "tooltip": "Confidence threshold as percentile (0-100). Default 50 = keep top 50% of points by confidence. Higher = fewer but more confident points."
+                }),
+                "gaussian_scale_multiplier": ("FLOAT", {
+                    "default": 0.1,
+                    "min": 0.1,
+                    "max": 5.0,
+                    "step": 0.1,
+                    "tooltip": "Multiplier for Gaussian splat size (higher = larger splats)"
+                }),
+                "preprocess_mode": (["crop", "pad"], {
+                    "default": "pad",
+                    "tooltip": "Preprocessing mode before VGGT inference"
+                }),
+                "upsample_depth": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Upsample depth/confidence maps to output resolution before creating point cloud"
+                }),
+                "auto_s0": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Estimate s0 (scale) per frame from depth and intrinsics"
+                }),
+                "mask_black_bg": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Filter out black background pixels (useful for images with black borders)"
+                }),
+                "mask_white_bg": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Filter out white background pixels (useful for images with white backgrounds)"
+                }),
+                "mask_sky": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Filter out sky using segmentation model (requires onnxruntime, downloads ~200MB model)"
+                }),
+                "boundary_threshold": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100,
+                    "tooltip": "Exclude points near image boundaries (pixels from edge). 0 = no boundary filtering"
+                }),
+                "max_depth": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -1.0,
+                    "max": 1000.0,
+                    "step": 1.0,
+                    "tooltip": "Maximum depth value to keep. -1 = no limit"
+                }),
+                "focal_length_multiplier": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.25,
+                    "max": 4.0,
+                    "step": 0.05,
+                    "tooltip": "Multiply VGGT's predicted focal length. <1.0 = wider FOV, >1.0 = narrower FOV"
+                }),
             }
         }
 
-    RETURN_TYPES = ("VGGT_POINTS", "VGGT_CAMERAS")
+    RETURN_TYPES = ("STRING", "EXTRINSICS", "INTRINSICS")
+    RETURN_NAMES = ("ply_path", "extrinsics", "intrinsics")
     FUNCTION = "infer"
     CATEGORY = "VGGT"
 
-    def infer(self, images, device):
-        # images is (B, H, W, C), range 0-1
+    def infer(self, image_1, device, image_2=None, image_3=None, image_4=None, prediction_mode="Depthmap and Camera Branch", depth_conf_threshold=1.01, gaussian_scale_multiplier=0.5, preprocess_mode="crop", upsample_depth=False, auto_s0=False, mask_black_bg=False, mask_white_bg=False, mask_sky=False, boundary_threshold=0, max_depth=-1.0, focal_length_multiplier=1.0):
+        # Combine multiple images into a sequence
+        images_list = [image_1]
+        if image_2 is not None:
+            images_list.append(image_2)
+        if image_3 is not None:
+            images_list.append(image_3)
+        if image_4 is not None:
+            images_list.append(image_4)
+        
+        # Concatenate images along batch dimension
+        if len(images_list) > 1:
+            # Stack them as a sequence: (B*S, H, W, C) -> will be handled as sequence
+            images = torch.cat(images_list, dim=0)
+            print(f"[VGGT] Processing {len(images_list)} images as sequence")
+        else:
+            images = image_1
+        
+        # images is (S, H, W, C) or (B*S, H, W, C), range 0-1
         batch_size, height, width, channels = images.shape
 
         # Prepare images for model (B, C, H, W)
-        model_input = images.permute(0, 3, 1, 2).to(device)
+        model_input = images.permute(0, 3, 1, 2)
+        
+        # Apply preprocessing to match demo_gradio.py (resize to 518px with proper aspect ratio)
+        target_size = 518
+        
+        if preprocess_mode == "crop":
+            # Demo default: set width to 518px, crop height if > 518
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+            
+            import torch.nn.functional as F
+            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
+            
+            # Center crop height if > 518
+            if new_height > target_size:
+                start_y = (new_height - target_size) // 2
+                model_input = model_input[:, :, start_y:start_y + target_size, :]
+                new_height = target_size
+            
+            print(f"[VGGT] Preprocessed (crop mode): {height}x{width} -> {new_height}x{new_width}")
+            height, width = new_height, new_width
+            
+        elif preprocess_mode == "pad":
+            # Pad mode: largest dimension = 518px, pad to square
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14
+            
+            import torch.nn.functional as F
+            model_input = F.interpolate(model_input, size=(new_height, new_width), mode='bicubic', align_corners=False)
+            
+            # Pad to square if needed
+            h_padding = target_size - new_height
+            w_padding = target_size - new_width
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                model_input = F.pad(model_input, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=1.0)
+                new_height = target_size
+                new_width = target_size
+            
+            print(f"[VGGT] Preprocessed (pad mode): {height}x{width} -> {new_height}x{new_width}")
+            height, width = new_height, new_width
+        else:
+            # No preprocessing - just ensure divisible by 14
+            target_height = round(height / 14) * 14
+            target_width = round(width / 14) * 14
+            
+            if target_height != height or target_width != width:
+                import torch.nn.functional as F
+                model_input = F.interpolate(model_input, size=(target_height, target_width), mode='bicubic', align_corners=False)
+                print(f"[VGGT] Resized to nearest 14x multiple: {height}x{width} -> {target_height}x{target_width}")
+                height, width = target_height, target_width
+        
+        # Move to device
+        model_input = model_input.to(device)
 
-        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-        from vggt.utils.geometry import unproject_depth_map_to_point_map
+        from vggt.models.vggt import VGGT
 
         model = get_vggt_model(device)
 
@@ -99,61 +371,164 @@ class VGGT_Model_Inference:
             else torch.float16
         )
 
+        # === EXACT SAME PROCESSING AS DEMO_GRADIO.PY ===
+        # Run inference (matching demo exactly)
+        print("[VGGT] Running inference...")
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=dtype, enabled=device == "cuda"):
                 predictions = model(model_input)
 
+        # Convert pose encoding to extrinsic and intrinsic matrices (demo approach)
+        print("[VGGT] Converting pose encoding to extrinsic and intrinsic matrices...")
         extrinsic, intrinsic = pose_encoding_to_extri_intri(
-            predictions["pose_enc"], (height, width)
+            predictions["pose_enc"], model_input.shape[-2:]
         )
+        predictions["extrinsic"] = extrinsic
+        predictions["intrinsic"] = intrinsic
 
-        depth = predictions["depth"]
-        depth_conf = predictions["depth_conf"]
+        # Convert to numpy for colors BEFORE deleting model_input
+        # Images are in (N, C, H, W) format from model_input
+        model_input_np = model_input.cpu().numpy().transpose(0, 2, 3, 1)  # (N, H, W, C)
+        
+        # Convert tensors to numpy - EXACTLY like demo does
+        print("[VGGT] Converting predictions to numpy...")
+        for key in predictions.keys():
+            if isinstance(predictions[key], torch.Tensor):
+                predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
+        predictions['pose_enc_list'] = None  # remove pose_enc_list
 
-        # Convert to numpy
-        extrinsic = extrinsic.cpu().numpy()
-        intrinsic = intrinsic.cpu().numpy()
-        depth = depth.cpu().numpy()
-        depth_conf = depth_conf.cpu().numpy()
-        images_np = images.cpu().numpy()
-
-        # Unproject points for all frames
-        world_points_batch = unproject_depth_map_to_point_map(
-            depth, extrinsic, intrinsic
+        # Generate world points from depth map - EXACTLY like demo does
+        print("[VGGT] Computing world points from depth map (depth-based unprojection)...")
+        depth_map = predictions["depth"]  # (S, H, W, 1)
+        world_points = unproject_depth_map_to_point_map(
+            depth_map, predictions["extrinsic"], predictions["intrinsic"]
         )
+        predictions["world_points_from_depth"] = world_points
 
-        cameras = []
-        for i in range(batch_size):
-            view_mat = build_view_matrix(extrinsic[i])
-            proj_mat = build_projection_matrix(intrinsic[i], width, height)
-            fov_y = 2.0 * np.arctan(0.5 * height / intrinsic[i, 1, 1])
-            cameras.append({
-                "view_matrix": view_mat,
-                "proj_matrix": proj_mat,
-                "fov_y": fov_y,
-                "extrinsic": extrinsic[i],
-                "intrinsic": intrinsic[i]
-            })
+        # Clean up GPU memory
+        del model_input
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
-        # For VGGT_POINTS, we'll just take the points from the first frame for now
-        # OR we could merge them all. Let's provide points from the first frame
-        # and allow the user to select which frame's points to use if needed.
-        # But typically we want a single point cloud.
+        # Extract outputs for point cloud generation (matching demo format)
+        # Select world points based on prediction mode (matching demo_gradio.py)
+        if "Pointmap" in prediction_mode:
+            print("[VGGT] Using Pointmap Branch (direct 3D prediction)")
+            if "world_points" in predictions:
+                world_points_batch = predictions["world_points"]
+                depth_conf = predictions.get("world_points_conf", np.ones_like(world_points_batch[..., 0]))
+            else:
+                print("[VGGT] WARNING: world_points not found, falling back to depth-based")
+                world_points_batch = predictions["world_points_from_depth"]
+                depth_conf = predictions["depth_conf"]
+        else:
+            print("[VGGT] Using Depthmap and Camera Branch (geometric unprojection)")
+            world_points_batch = predictions["world_points_from_depth"]
+            depth_conf = predictions["depth_conf"]
+        
+        extrinsic_np = predictions["extrinsic"]  # (S, 3, 4)
+        intrinsic_np = predictions["intrinsic"]  # (S, 3, 3)
+        
+        print(f"[VGGT] Point cloud generation:")
+        print(f"[VGGT]   World points shape: {world_points_batch.shape}")
+        print(f"[VGGT]   Model input (resized) shape: {model_input_np.shape}")
+        print(f"[VGGT]   Depth confidence shape: {depth_conf.shape}")
+        
+        # Flatten all frames into single point cloud (matching demo approach)
+        S, H, W, _ = world_points_batch.shape
+        points_all_frames = world_points_batch.reshape(-1, 3)  # (S*H*W, 3)
+        
+        # Use MODEL INPUT IMAGES (resized to match world points) for colors
+        # Keep in [0, 1] range - write_ply_basic handles conversion to SH coefficients
+        colors_all_frames = model_input_np.reshape(-1, 3).astype(np.float32)  # (S*H*W, 3) in [0, 1]
+        
+        # Flatten confidence scores
+        if depth_conf.ndim == 4:
+            conf_all_frames = depth_conf.squeeze(-1).reshape(-1)
+        else:
+            conf_all_frames = depth_conf.reshape(-1)
+        
+        print(f"[VGGT]   Flattened points: {points_all_frames.shape}")
+        print(f"[VGGT]   Flattened colors: {colors_all_frames.shape} (range: [{colors_all_frames.min():.3f}, {colors_all_frames.max():.3f}])")
+        print(f"[VGGT]   Flattened confidence: {conf_all_frames.shape}")
+        print(f"[VGGT]   Confidence stats: min={conf_all_frames.min():.4f}, max={conf_all_frames.max():.4f}, mean={conf_all_frames.mean():.4f}")
+        
+        # Apply PERCENTILE-based confidence filtering (matching demo_gradio.py approach)
+        # This filters out the bottom X% of points by confidence, not absolute threshold
+        if depth_conf_threshold == 0.0:
+            conf_threshold_value = 0.0
+            percentile = 0.0
+        else:
+            # depth_conf_threshold is interpreted as percentile (0-100)
+            # Default 50.0 means 50th percentile - keep top 50% of points
+            percentile = depth_conf_threshold if depth_conf_threshold > 1.0 else depth_conf_threshold * 100
+            conf_threshold_value = np.percentile(conf_all_frames, percentile)
+        
+        # Warning for users with old workflows
+        if 0 < depth_conf_threshold < 1.0:
+            print(f"[VGGT] ⚠️ WARNING: depth_conf_threshold={depth_conf_threshold} is very low!")
+            print(f"[VGGT] ⚠️ This parameter is now a PERCENTILE (0-100). Use 50.0 for default quality.")
+            print(f"[VGGT] ⚠️ Current setting keeps top {100-percentile:.1f}% of points (too many noisy points!)")
+        
+        print(f"[VGGT]   Confidence filtering: percentile={percentile:.1f}%, threshold_value={conf_threshold_value:.4f}")
+        valid_mask_all = (conf_all_frames >= conf_threshold_value) & (conf_all_frames > 1e-5)
+        
+        # Apply max depth filtering to all frames
+        if max_depth > 0:
+            # Compute depth as distance from camera (simple approximation)
+            depth_all = np.linalg.norm(points_all_frames, axis=1)
+            valid_mask_all = valid_mask_all & (depth_all <= max_depth)
+            print(f"[VGGT] Applied max_depth filter: {max_depth}")
+        
+        # Apply boundary filtering to all frames
+        if boundary_threshold > 0:
+            # Create boundary mask for each frame
+            boundary_mask = np.ones(S * H * W, dtype=bool)
+            for s in range(S):
+                frame_offset = s * H * W
+                # Top and bottom
+                boundary_mask[frame_offset : frame_offset + boundary_threshold * W] = False
+                boundary_mask[frame_offset + (H - boundary_threshold) * W : frame_offset + H * W] = False
+                # Left and right (per row)
+                for h in range(boundary_threshold, H - boundary_threshold):
+                    row_start = frame_offset + h * W
+                    boundary_mask[row_start : row_start + boundary_threshold] = False
+                    boundary_mask[row_start + W - boundary_threshold : row_start + W] = False
+            valid_mask_all = valid_mask_all & boundary_mask
+            print(f"[VGGT] Applied boundary_threshold filter: {boundary_threshold}px")
+        
+        # Apply black/white background filtering
+        if mask_black_bg:
+            color_sum = colors_all_frames.sum(axis=1)
+            black_mask = color_sum >= (16 / 255.0)
+            valid_mask_all = valid_mask_all & black_mask
+            print(f"[VGGT] Applied mask_black_bg filter")
+        
+        if mask_white_bg:
+            white_mask = ~((colors_all_frames[:, 0] > 240/255.0) & (colors_all_frames[:, 1] > 240/255.0) & (colors_all_frames[:, 2] > 240/255.0))
+            valid_mask_all = valid_mask_all & white_mask
+            print(f"[VGGT] Applied mask_white_bg filter")
+        
+        points = points_all_frames[valid_mask_all]
+        colors = colors_all_frames[valid_mask_all]
+        confidences = conf_all_frames[valid_mask_all]
+        
+        print(f"[VGGT] Confidence threshold: {depth_conf_threshold}")
+        print(f"[VGGT] Points before filtering: {len(points_all_frames)}")
+        print(f"[VGGT] Points after confidence filtering: {len(points)}")
+        
+        # Ensure correct shapes
+        if points.ndim != 2 or points.shape[1] != 3:
+            print(f"Warning: Unexpected points shape {points.shape}, reshaping...")
+            points = points.reshape(-1, 3)
+        if colors.ndim != 2 or colors.shape[1] != 3:
+            print(f"Warning: Unexpected colors shape {colors.shape}, reshaping...")
+            colors = colors.reshape(-1, 3)
+        if confidences.ndim != 1:
+            print(f"Warning: Unexpected confidences shape {confidences.shape}, flattening...")
+            confidences = confidences.flatten()
 
-        # For simplicity, return the first frame's points but all cameras
-        vggt_points = {
-            "points": world_points_batch[0].reshape(-1, 3),
-            "colors": images_np[0].reshape(-1, 3),
-            "confidences": depth_conf[0].reshape(-1),
-            "all_points": world_points_batch,
-            "all_colors": images_np,
-            "all_confidences": depth_conf,
-            "width": width,
-            "height": height,
-            "cameras": cameras
-        }
-
-        # Optionally save a temporary PLY for the viewer
+        # Save PLY file
         import folder_paths
         import uuid
         output_dir = folder_paths.get_output_directory()
@@ -161,232 +536,25 @@ class VGGT_Model_Inference:
         ply_filename = f"vggt_temp_{temp_id}.ply"
         ply_path = os.path.join(output_dir, ply_filename)
 
-        write_ply_basic(ply_path, vggt_points["points"], vggt_points["colors"], vggt_points["confidences"])
-        vggt_points["ply_path"] = ply_filename # ComfyUI prefers relative to output/input
+        write_ply_basic(ply_path, points, colors, confidences, gaussian_scale_multiplier)
+        print(f"Saved PLY file: {ply_path} with {len(points)} points")
+        print(f"  Points range - X: [{points[:, 0].min():.3f}, {points[:, 0].max():.3f}]")
+        print(f"  Points range - Y: [{points[:, 1].min():.3f}, {points[:, 1].max():.3f}]")
+        print(f"  Points range - Z: [{points[:, 2].min():.3f}, {points[:, 2].max():.3f}]")
+        print(f"  Colors range: [{colors.min():.3f}, {colors.max():.3f}]")
+        print(f"  Confidences range: [{confidences.min():.3f}, {confidences.max():.3f}]")
 
-        return (vggt_points, cameras)
+        # Extract first camera's extrinsics and intrinsics for GaussianViewer
+        # Convert numpy arrays to lists for compatibility
+        first_extrinsics = extrinsic_np[0].tolist() if extrinsic_np.ndim > 2 and len(extrinsic_np) > 0 else [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]
+        first_intrinsics = intrinsic_np[0].tolist() if intrinsic_np.ndim > 2 and len(intrinsic_np) > 0 else [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
 
-class VGGT_PLY_Loader:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "ply_path": ("STRING", {"default": "output/scene1/image2_reference.ply"}),
-            }
-        }
+        print(f"[VGGT] Camera matrices for GaussianViewer:")
+        print(f"[VGGT]   Extrinsic (3x4 camera-from-world):")
+        for row in first_extrinsics:
+            print(f"[VGGT]     {row}")
+        print(f"[VGGT]   Intrinsic (3x3 camera calibration):")
+        for row in first_intrinsics:
+            print(f"[VGGT]     {row}")
 
-    RETURN_TYPES = ("VGGT_POINTS", "VGGT_CAMERAS")
-    FUNCTION = "load_ply"
-    CATEGORY = "VGGT"
-
-    def load_ply(self, ply_path):
-        if not os.path.exists(ply_path):
-            # Try relative to repo root if not found
-            root_ply_path = Path(__file__).parent / ply_path
-            if root_ply_path.exists():
-                ply_path = str(root_ply_path)
-            else:
-                raise FileNotFoundError(f"PLY file not found: {ply_path}")
-
-        with open(ply_path, "rb") as f:
-            header = ""
-            while "end_header" not in header:
-                line = f.readline().decode("ascii")
-                header += line
-                if "element vertex" in line:
-                    num_points = int(line.split()[-1])
-
-            # Check for confidence property
-            has_confidence = "property float confidence" in header
-
-            # Read binary data
-            # fffBBB (12 + 3 = 15 bytes) or fffBBBf (15 + 4 = 19 bytes)
-            point_size = 19 if has_confidence else 15
-            data = f.read(num_points * point_size)
-
-            # Use numpy for faster loading if possible
-            if has_confidence:
-                dt = np.dtype([
-                    ('pos', 'f4', 3),
-                    ('color', 'u1', 3),
-                    ('conf', 'f4', 1)
-                ])
-            else:
-                dt = np.dtype([
-                    ('pos', 'f4', 3),
-                    ('color', 'u1', 3)
-                ])
-
-            array = np.frombuffer(data, dtype=dt)
-            points = array['pos'].astype(np.float32)
-            colors = array['color'].astype(np.float32) / 255.0
-            if has_confidence:
-                confidences = array['conf'].astype(np.float32).flatten()
-            else:
-                confidences = np.ones(num_points, dtype=np.float32)
-
-            # Check for sidecar JSON with camera info
-            json_path = ply_path.replace(".ply", ".json")
-            cameras = []
-            if os.path.exists(json_path):
-                try:
-                    with open(json_path, "r") as f:
-                        cam_data = json.load(f)
-                        if isinstance(cam_data, dict):
-                            cam_data = [cam_data]
-
-                        for cam in cam_data:
-                            extrinsic = np.array(cam["extrinsic"])
-                            intrinsic = np.array(cam["intrinsic"])
-                            width = cam.get("width", 512)
-                            height = cam.get("height", 512)
-                            view_mat = build_view_matrix(extrinsic)
-                            proj_mat = build_projection_matrix(intrinsic, width, height)
-                            fov_y = 2.0 * np.arctan(0.5 * height / intrinsic[1, 1])
-                            cameras.append({
-                                "view_matrix": view_mat,
-                                "proj_matrix": proj_mat,
-                                "fov_y": fov_y,
-                                "extrinsic": extrinsic,
-                                "intrinsic": intrinsic
-                            })
-                except Exception as e:
-                    print(f"Warning: Failed to load camera sidecar {json_path}: {e}")
-
-            vggt_points = {
-                "points": points,
-                "colors": colors,
-                "confidences": confidences,
-                "ply_path": ply_path,
-                "cameras": cameras
-            }
-            return (vggt_points, cameras)
-
-class VGGT_PLY_Viewer:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "vggt_points": ("VGGT_POINTS",),
-                "camera_state": ("STRING", {"default": "", "multiline": True}),
-            },
-            "optional": {
-                "vggt_cameras": ("VGGT_CAMERAS",),
-            }
-        }
-
-    RETURN_TYPES = ("VGGT_CAMERA",)
-    FUNCTION = "get_camera"
-    CATEGORY = "VGGT"
-    OUTPUT_NODE = True
-
-    def get_camera(self, vggt_points, camera_state, vggt_cameras=None):
-        # Notify the UI about the PLY path and cameras
-        ui_data = {
-            "ply_path": vggt_points.get("ply_path", ""),
-            "cameras": []
-        }
-
-        all_cams = vggt_cameras if vggt_cameras is not None else vggt_points.get("cameras", [])
-        for cam in all_cams:
-            ui_data["cameras"].append({
-                "view_matrix": cam["view_matrix"].tolist(),
-                "proj_matrix": cam["proj_matrix"].tolist(),
-                "fov_y": cam["fov_y"]
-            })
-
-        if camera_state:
-            try:
-                state = json.loads(camera_state)
-                view_mat = np.array(state["view_matrix"], dtype=np.float32).reshape(4, 4)
-                proj_mat = np.array(state["proj_matrix"], dtype=np.float32).reshape(4, 4)
-                fov_y = float(state["fov_y"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-                print(f"Warning: Invalid camera_state: {e}. Falling back to default.")
-                camera_state = None # Force fallback
-
-        if not camera_state:
-            if all_cams:
-                view_mat = all_cams[0]["view_matrix"]
-                proj_mat = all_cams[0]["proj_matrix"]
-                fov_y = all_cams[0]["fov_y"]
-        else:
-            # Default camera: look at the center of the point cloud
-            points = vggt_points["points"]
-            center = points.mean(axis=0)
-            extent = points.max(axis=0) - points.min(axis=0)
-            max_extent = extent.max()
-
-            # Simple default view matrix (looking from some distance)
-            view_mat = np.eye(4, dtype=np.float32)
-            view_mat[2, 3] = -max_extent * 2 # Move back
-            view_mat[:3, 3] += np.dot(view_mat[:3, :3], -center) # Look at center
-
-            # Default projection matrix
-            fov_y = 0.785 # 45 degrees
-            aspect = 1.0
-            near = 0.01
-            far = max_extent * 100
-
-            f = 1.0 / np.tan(fov_y / 2.0)
-            proj_mat = np.zeros((4, 4), dtype=np.float32)
-            proj_mat[0, 0] = f / aspect
-            proj_mat[1, 1] = f
-            proj_mat[2, 2] = -(far + near) / (far - near)
-            proj_mat[2, 3] = -(2.0 * far * near) / (far - near)
-            proj_mat[3, 2] = -1.0
-
-        return {"ui": ui_data, "result": ({"view_matrix": view_mat, "proj_matrix": proj_mat, "fov_y": fov_y},)}
-
-class VGGT_PLY_Renderer:
-    def __init__(self):
-        self.renderer = None
-        self.last_config = None
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "vggt_points": ("VGGT_POINTS",),
-                "vggt_camera": ("VGGT_CAMERA",),
-                "width": ("INT", {"default": 512, "min": 64, "max": 4096}),
-                "height": ("INT", {"default": 512, "min": 64, "max": 4096}),
-                "confidence_threshold": ("FLOAT", {"default": 1.01, "min": 0.0, "max": 2.0}),
-                "sigma": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 100.0}),
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "render"
-    CATEGORY = "VGGT"
-
-    def render(self, vggt_points, vggt_camera, width, height, confidence_threshold, sigma):
-        current_config = (width, height, confidence_threshold, sigma)
-
-        if self.renderer is None or self.last_config != current_config:
-            # Use the directory of this file to find shaders
-            shaders_dir = Path(__file__).parent / "shaders"
-
-            self.renderer = HoleFillingRenderer(
-                width=width,
-                height=height,
-                shaders_dir=shaders_dir,
-                confidence_threshold=confidence_threshold,
-                jfa_mask_sigma=sigma
-            )
-            self.last_config = current_config
-
-        img = self.renderer.render(
-            points=vggt_points["points"],
-            colors=vggt_points["colors"],
-            confidences=vggt_points["confidences"],
-            view_mat=vggt_camera["view_matrix"],
-            proj_mat=vggt_camera["proj_matrix"],
-            fov_y=vggt_camera["fov_y"]
-        )
-
-        # Convert to ComfyUI image tensor (B, H, W, C) range 0-1
-        img_tensor = torch.from_numpy(img).float() / 255.0
-        img_tensor = img_tensor.unsqueeze(0) # Add batch dimension
-
-        return (img_tensor,)
+        return (ply_path, first_extrinsics, first_intrinsics)
