@@ -1,0 +1,15 @@
+[project]
+name = "vggt-dataset-builder"
+version = "0.0.1"
+requires-python = ">= 3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --strict-markers"
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+]
