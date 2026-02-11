@@ -752,7 +752,7 @@ def estimate_s0_from_depth(
     if not np.any(valid):
         return 0.0
 
-    # ⚡ Bolt: Only compute spacing for valid points to avoid unnecessary calculations
+    # Bolt: Only compute spacing for valid points to avoid unnecessary calculations
     # on the entire depth map.
     valid_depths = depth_map[valid]
     fx = float(intrinsic[0, 0])
