@@ -299,9 +299,15 @@ def apply_background_filters(
         mask &= (colors.sum(axis=1) >= (16 / 255.0))
     
     if filter_white:
-        # RGB > 240/255 approx 0.9412 in 0-1 float range
-        threshold = 240 / 255.0
-        mask &= ~((colors[:, 0] > threshold) & (colors[:, 1] > threshold) & (colors[:, 2] > threshold))
+        # Match previous uint8 semantics:
+        # old code was roughly (colors * 255).astype(np.uint8) > 240, i.e. floor(c * 255) > 240
+        colors_255 = np.floor(colors * 255.0)
+        white_mask = (
+            (colors_255[:, 0] > 240)
+            & (colors_255[:, 1] > 240)
+            & (colors_255[:, 2] > 240)
+        )
+        mask &= ~white_mask
     
     return mask
 
