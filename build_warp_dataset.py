@@ -2,6 +2,7 @@ import argparse
 import json
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 # Add the vggt submodule to the path so its internal imports work
@@ -892,111 +893,235 @@ def intrinsic_for_output(
     return intrinsic_out
 
 
-def main() -> None:
-    args = parse_args()
-    input_dir = args.input_dir
-    output_dir = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+def render_and_save_pair(
+    source_idx: int,
+    target_idx: int,
+    image_paths: list[Path],
+    scene_output_dir: Path,
+    output_ext: str,
+    save_kwargs: dict,
+    args: argparse.Namespace,
+    depth: np.ndarray,
+    depth_conf: np.ndarray,
+    world_points: np.ndarray,
+    images_np: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    preprocess_metas: list[dict],
+    renderer: HoleFillingRenderer,
+    render_width: int,
+    render_height: int,
+    resize_size: tuple[int, int] | None,
+    skyseg_session,
+) -> None:
+    """Render and save a single image pair (source -> target)."""
+    target_name = image_paths[target_idx].stem
 
-    if (args.resize_width == 0) != (args.resize_height == 0):
-        raise ValueError("Both resize width and height must be set or both 0.")
-    resize_size = None
-    if args.resize_width > 0 and args.resize_height > 0:
-        resize_size = (args.resize_width, args.resize_height)
-        resize_megapixels = (resize_size[0] * resize_size[1]) / 1_000_000
-        if args.max_megapixels > 0 and resize_megapixels > args.max_megapixels:
-            scale = (args.max_megapixels / resize_megapixels) ** 0.5
-            resize_size = (
-                max(1, int(round(resize_size[0] * scale))),
-                max(1, int(round(resize_size[1] * scale))),
-            )
-            print(
-                f"Rescaling resize-size to honor max megapixels: {resize_size[0]}x{resize_size[1]}"
-            )
+    splats_path = scene_output_dir / f"{target_name}_splats.{output_ext}"
+    target_path = scene_output_dir / f"{target_name}_target.{output_ext}"
+    reference_path = scene_output_dir / f"{target_name}_reference.{output_ext}"
+    conf_path = scene_output_dir / f"{target_name}_confidence.png"
+    ply_path = scene_output_dir / f"{target_name}_reference.ply"
 
-    scene_dirs = list_scene_dirs(input_dir)
-    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_name)
-    dtype = (
-        torch.bfloat16
-        if device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8
-        else torch.float16
+    missing = (
+        not splats_path.exists()
+        or not target_path.exists()
+        or not reference_path.exists()
+        or (args.save_confidence and not conf_path.exists())
+        or (args.save_ply and not ply_path.exists())
     )
 
-    model = load_model(device)
-    renderer: HoleFillingRenderer | None = None
-    renderer_size: tuple[int, int] | None = None
-    shaders_dir = Path(__file__).resolve().parent / "shaders"
-    
-    # Initialize sky segmentation if needed
-    skyseg_session = None
-    if args.filter_sky:
-        if not SKY_FILTER_AVAILABLE:
-            print("Warning: --filter-sky requires opencv-python and onnxruntime. Install with:")
-            print("  uv pip install opencv-python onnxruntime")
-            print("Sky filtering will be disabled.")
-        else:
-            skyseg_path = Path("skyseg.onnx")
-            if not skyseg_path.exists():
-                print("Downloading sky segmentation model...")
-                download_file_from_url(
-                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
-                    "skyseg.onnx"
-                )
-            skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
-
-    for scene_dir in scene_dirs:
-        try:
-            image_paths, auto_skip_note = scene_image_paths(
-                scene_dir,
-                args.skip_every,
-                args.auto_skip,
-                args.target_overlap,
-                args.limit,
-            )
-        except ValueError as exc:
-            print(f"Skipping {scene_dir}: {exc}")
-            continue
-
-        output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
-        
-        scene_output_dir = output_dir / scene_dir.name
-        scene_output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Check upfront if this scene needs any processing (before rescaling to save time)
-        scene_needs_work = check_scene_needs_processing(
-            scene_dir,
-            output_dir,
-            output_ext,
-            args.bidirectional,
-            args.save_confidence,
-            args.save_ply,
-            image_paths,
+    if not missing:
+        print(
+            f"Skipped {scene_output_dir.name}/{target_name}_* (direction already complete)"
         )
-        
-        if not scene_needs_work:
-            print(f"Skipping {scene_dir.name}: all triplets already complete")
-            continue
-        
-        print(f"Processing {scene_dir.name}...")
+        return
 
-        if auto_skip_note is not None:
-            print(
-                f"Auto skip for {scene_dir.name}: {auto_skip_note} "
-                f"(target overlap {args.target_overlap})."
+    depth_frame = depth[source_idx]
+    conf_frame = depth_conf[source_idx]
+    if depth_frame.ndim == 3:
+        depth_frame = depth_frame.squeeze(-1)
+    if conf_frame.ndim == 3:
+        conf_frame = conf_frame.squeeze(-1)
+
+    # Apply sky filtering if enabled
+    if args.filter_sky and skyseg_session is not None:
+        sky_masks_dir = scene_output_dir / "sky_masks"
+        conf_frame = apply_sky_filter(
+            conf_frame, image_paths[source_idx], skyseg_session, sky_masks_dir
+        )
+
+    valid_mask = depth_frame > 1e-6
+
+    points = world_points[source_idx][valid_mask]
+    colors = images_np[source_idx][valid_mask]
+    confidences = conf_frame[valid_mask]
+
+    # Apply background filtering if enabled
+    if args.filter_black_bg or args.filter_white_bg:
+        bg_mask = apply_background_filters(
+            colors, args.filter_black_bg, args.filter_white_bg
+        )
+        points = points[bg_mask]
+        colors = colors[bg_mask]
+        confidences = confidences[bg_mask]
+
+    if args.auto_s0:
+        s0 = estimate_s0_from_depth(depth_frame, intrinsic[source_idx])
+        if s0 > 0.0:
+            renderer.s0 = s0
+
+    view_mat = build_view_matrix(extrinsic[target_idx])
+    if args.upsample_depth:
+        target_intrinsic = intrinsic[target_idx]
+    else:
+        target_intrinsic = intrinsic_for_output(
+            intrinsic[target_idx], preprocess_metas[target_idx], resize_size
+        )
+    proj_mat = build_projection_matrix(target_intrinsic, render_width, render_height)
+    fov_y = 2.0 * np.arctan(0.5 * render_height / target_intrinsic[1, 1])
+
+    model_render = renderer.render(
+        points, colors, confidences, view_mat, proj_mat, fov_y
+    )
+    if args.upsample_depth or resize_size is not None:
+        splats_image = model_render
+    else:
+        splats_image = restore_to_original_resolution(
+            model_render, preprocess_metas[target_idx], args.preprocess_mode
+        )
+
+    if not splats_path.exists():
+        Image.fromarray(splats_image).save(splats_path, **save_kwargs)
+
+    if args.save_confidence and not conf_path.exists():
+        # Save confidence map for the source frame (source_idx) as grayscale
+        conf_for_save = conf_frame.copy()
+        # Normalize to 0-255 range
+        conf_min = conf_for_save.min()
+        conf_max = conf_for_save.max()
+        if conf_max > conf_min:
+            conf_normalized = (conf_for_save - conf_min) / (conf_max - conf_min)
+        else:
+            conf_normalized = np.zeros_like(conf_for_save)
+        conf_uint8 = (conf_normalized * 255).astype(np.uint8)
+        if not args.upsample_depth and resize_size is None:
+            # Restore to original resolution
+            conf_image = Image.fromarray(conf_uint8, mode="L")
+            meta = preprocess_metas[source_idx]
+            left = int(meta["total_pad_left"])
+            top = int(meta["total_pad_top"])
+            right = left + int(meta["effective_width"])
+            bottom = top + int(meta["effective_height"])
+            conf_image = conf_image.crop((left, top, right, bottom))
+            conf_image = conf_image.resize(
+                (int(meta["orig_width"]), int(meta["orig_height"])),
+                Image.Resampling.BICUBIC,
             )
-        
-        # Create temporary directory for rescaled images (cleaned up later)
-        temp_resized_dir = None
-        if args.max_megapixels > 0:
-            import tempfile
-            temp_resized_dir = Path(tempfile.mkdtemp(prefix=f"rescale_{scene_dir.name}_"))
-            image_paths, resize_note = rescale_scene_images_to_max_megapixels(
-                image_paths, args.max_megapixels, temp_resized_dir
-            )
-            if resize_note is not None:
-                print(f"{scene_dir.name}: {resize_note}")
-        
+        else:
+            conf_image = Image.fromarray(conf_uint8, mode="L")
+            if resize_size is not None:
+                conf_image = conf_image.resize(resize_size, Image.Resampling.BICUBIC)
+        # Always save confidence as PNG for lossless grayscale
+        conf_image.save(conf_path)
+
+    if not target_path.exists() or not reference_path.exists():
+        target_img_obj = Image.open(image_paths[target_idx])
+        reference_img_obj = Image.open(image_paths[source_idx])
+        try:
+            target_img_obj = target_img_obj.convert("RGB")
+            reference_img_obj = reference_img_obj.convert("RGB")
+            if resize_size is not None:
+                target_img_obj = target_img_obj.resize(
+                    resize_size, Image.Resampling.BICUBIC
+                )
+                reference_img_obj = reference_img_obj.resize(
+                    resize_size, Image.Resampling.BICUBIC
+                )
+            if not target_path.exists():
+                target_img_obj.save(target_path, **save_kwargs)
+            if not reference_path.exists():
+                reference_img_obj.save(reference_path, **save_kwargs)
+        finally:
+            target_img_obj.close()
+            reference_img_obj.close()
+
+    # Save PLY file if requested
+    if args.save_ply and not ply_path.exists():
+        write_ply(
+            ply_path, points, colors, confidences if args.save_confidence else None
+        )
+
+    ply_note = f" and {target_name}_reference.ply" if args.save_ply else ""
+    print(
+        f"Wrote {scene_output_dir.name}/{splats_path.name}, {target_path.name}, "
+        f"and {reference_path.name}{ply_note}"
+    )
+
+
+def process_scene(
+    scene_dir: Path,
+    args: argparse.Namespace,
+    model: VGGT,
+    device: torch.device,
+    dtype: torch.dtype,
+    renderer_info: dict,
+    skyseg_session,
+    output_dir: Path,
+    resize_size: tuple[int, int] | None,
+) -> None:
+    """Process all image pairs in a single scene."""
+    try:
+        image_paths, auto_skip_note = scene_image_paths(
+            scene_dir,
+            args.skip_every,
+            args.auto_skip,
+            args.target_overlap,
+            args.limit,
+        )
+    except ValueError as exc:
+        print(f"Skipping {scene_dir}: {exc}")
+        return
+
+    output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
+
+    scene_output_dir = output_dir / scene_dir.name
+    scene_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check upfront if this scene needs any processing (before rescaling to save time)
+    scene_needs_work = check_scene_needs_processing(
+        scene_dir,
+        output_dir,
+        output_ext,
+        args.bidirectional,
+        args.save_confidence,
+        args.save_ply,
+        image_paths,
+    )
+
+    if not scene_needs_work:
+        print(f"Skipping {scene_dir.name}: all triplets already complete")
+        return
+
+    print(f"Processing {scene_dir.name}...")
+
+    if auto_skip_note is not None:
+        print(
+            f"Auto skip for {scene_dir.name}: {auto_skip_note} "
+            f"(target overlap {args.target_overlap})."
+        )
+
+    # Create temporary directory for rescaled images (cleaned up later)
+    temp_resized_dir = None
+    if args.max_megapixels > 0:
+        temp_resized_dir = Path(tempfile.mkdtemp(prefix=f"rescale_{scene_dir.name}_"))
+        image_paths, resize_note = rescale_scene_images_to_max_megapixels(
+            image_paths, args.max_megapixels, temp_resized_dir
+        )
+        if resize_note is not None:
+            print(f"{scene_dir.name}: {resize_note}")
+
+    try:
         print(f"Loading {len(image_paths)} images from {scene_dir}...")
         images = load_and_preprocess_images(
             [str(path) for path in image_paths],
@@ -1030,17 +1155,21 @@ def main() -> None:
                     ):
                         mismatched_resolutions = True
                         break
-                
+
                 # If resolutions don't match, use the minimum dimensions to avoid upscaling
                 if mismatched_resolutions:
                     print(
                         f"Images in {scene_dir.name} have different resolutions. "
                         f"Using minimum dimensions for output size."
                     )
-                    min_width = min(int(meta["orig_width"]) for meta in preprocess_metas)
-                    min_height = min(int(meta["orig_height"]) for meta in preprocess_metas)
+                    min_width = min(
+                        int(meta["orig_width"]) for meta in preprocess_metas
+                    )
+                    min_height = min(
+                        int(meta["orig_height"]) for meta in preprocess_metas
+                    )
                     output_size = (min_width, min_height)
-            
+
             # Apply megapixel limit
             width, height = output_size
             megapixels = (width * height) / 1_000_000
@@ -1053,7 +1182,7 @@ def main() -> None:
                     f"Scaling output from {megapixels:.2f}MP to {args.max_megapixels:.2f}MP: "
                     f"{output_size[0]}x{output_size[1]}"
                 )
-            
+
             render_width, render_height = output_size
         else:
             output_size = None
@@ -1078,6 +1207,7 @@ def main() -> None:
         depth_conf = depth_conf.squeeze(0).cpu().numpy()
         extrinsic = extrinsic.squeeze(0).cpu().numpy()
         intrinsic = intrinsic.squeeze(0).cpu().numpy()
+
         if args.upsample_depth:
             if output_size is None:
                 raise ValueError("Output size is required when upsampling depth.")
@@ -1094,23 +1224,23 @@ def main() -> None:
             conf_frames = []
             intrinsic_frames = []
             for idx, meta in enumerate(preprocess_metas):
-                depth_frame = depth[idx]
-                if depth_frame.ndim == 3:
-                    depth_frame = depth_frame.squeeze(-1)
-                conf_frame = depth_conf[idx]
-                if conf_frame.ndim == 3:
-                    conf_frame = conf_frame.squeeze(-1)
+                depth_frame_map = depth[idx]
+                if depth_frame_map.ndim == 3:
+                    depth_frame_map = depth_frame_map.squeeze(-1)
+                conf_frame_map = depth_conf[idx]
+                if conf_frame_map.ndim == 3:
+                    conf_frame_map = conf_frame_map.squeeze(-1)
 
-                depth_frame = restore_map_to_original_resolution(
-                    depth_frame, meta, args.preprocess_mode
+                depth_frame_map = restore_map_to_original_resolution(
+                    depth_frame_map, meta, args.preprocess_mode
                 )
-                conf_frame = restore_map_to_original_resolution(
-                    conf_frame, meta, args.preprocess_mode, fill_value=0.0
+                conf_frame_map = restore_map_to_original_resolution(
+                    conf_frame_map, meta, args.preprocess_mode, fill_value=0.0
                 )
-                depth_frame = resize_map_to_output(depth_frame, output_size)
-                conf_frame = resize_map_to_output(conf_frame, output_size)
-                depth_frames.append(depth_frame)
-                conf_frames.append(conf_frame)
+                depth_frame_map = resize_map_to_output(depth_frame_map, output_size)
+                conf_frame_map = resize_map_to_output(conf_frame_map, output_size)
+                depth_frames.append(depth_frame_map)
+                conf_frames.append(conf_frame_map)
                 intrinsic_frames.append(
                     intrinsic_for_output(intrinsic[idx], meta, output_size)
                 )
@@ -1123,6 +1253,11 @@ def main() -> None:
             images_np = images.cpu().numpy().transpose(0, 2, 3, 1)
             depth_for_unproject = ensure_depth_channel(depth)
 
+        # Renderer management
+        renderer = renderer_info["renderer"]
+        renderer_size = renderer_info["renderer_size"]
+        shaders_dir = renderer_info["shaders_dir"]
+
         if renderer is None or renderer_size != (render_height, render_width):
             renderer = HoleFillingRenderer(
                 render_width,
@@ -1131,7 +1266,8 @@ def main() -> None:
                 confidence_threshold=args.depth_conf_threshold,
                 jfa_mask_sigma=args.sigma,
             )
-            renderer_size = (render_height, render_width)
+            renderer_info["renderer"] = renderer
+            renderer_info["renderer_size"] = (render_height, render_width)
         else:
             renderer.confidence_threshold = args.depth_conf_threshold
 
@@ -1139,310 +1275,59 @@ def main() -> None:
             depth_for_unproject, extrinsic, intrinsic
         )
 
+        save_kwargs = {"quality": 95, "optimize": True} if output_ext == "jpg" else {}
+
         for idx in range(len(image_paths) - 1):
             next_idx = idx + 1
-            next_name = image_paths[next_idx].stem
-            curr_name = image_paths[idx].stem
 
-            output_ext = "jpg" if args.output_format in ["jpg", "jpeg"] else args.output_format
-            save_kwargs = {"quality": 95, "optimize": True} if output_ext == "jpg" else {}
-            
-            # Setup paths for this pair
-            forward_splats_path = scene_output_dir / f"{next_name}_splats.{output_ext}"
-            forward_target_path = scene_output_dir / f"{next_name}_target.{output_ext}"
-            forward_reference_path = scene_output_dir / f"{next_name}_reference.{output_ext}"
-            forward_conf_path = scene_output_dir / f"{next_name}_confidence.png"
-            forward_ply_path = scene_output_dir / f"{next_name}_reference.ply"
-            
-            forward_missing = (
-                not forward_splats_path.exists() or 
-                not forward_target_path.exists() or 
-                not forward_reference_path.exists() or
-                (args.save_confidence and not forward_conf_path.exists()) or
-                (args.save_ply and not forward_ply_path.exists())
+            # Forward: idx -> next_idx
+            render_and_save_pair(
+                idx,
+                next_idx,
+                image_paths,
+                scene_output_dir,
+                output_ext,
+                save_kwargs,
+                args,
+                depth,
+                depth_conf,
+                world_points,
+                images_np,
+                extrinsic,
+                intrinsic,
+                preprocess_metas,
+                renderer,
+                render_width,
+                render_height,
+                resize_size,
+                skyseg_session,
             )
 
-            # ========== Forward direction: idx -> next_idx (A -> B) ==========
-            if forward_missing:
-                depth_frame = depth[idx]
-                conf_frame = depth_conf[idx]
-                if depth_frame.ndim == 3:
-                    depth_frame = depth_frame.squeeze(-1)
-                if conf_frame.ndim == 3:
-                    conf_frame = conf_frame.squeeze(-1)
-                
-                # Apply sky filtering if enabled
-                if args.filter_sky and skyseg_session is not None:
-                    sky_masks_dir = scene_output_dir / "sky_masks"
-                    conf_frame = apply_sky_filter(
-                        conf_frame, image_paths[idx], skyseg_session, sky_masks_dir
-                    )
-                
-                valid_mask = depth_frame > 1e-6
-
-                points = world_points[idx][valid_mask]
-                colors = images_np[idx][valid_mask]
-                confidences = conf_frame[valid_mask]
-                
-                # Apply background filtering if enabled
-                if args.filter_black_bg or args.filter_white_bg:
-                    bg_mask = apply_background_filters(
-                        colors, args.filter_black_bg, args.filter_white_bg
-                    )
-                    points = points[bg_mask]
-                    colors = colors[bg_mask]
-                    confidences = confidences[bg_mask]
-
-                if args.auto_s0:
-                    s0 = estimate_s0_from_depth(depth_frame, intrinsic[idx])
-                    if s0 > 0.0:
-                        renderer.s0 = s0
-
-                view_mat = build_view_matrix(extrinsic[next_idx])
-                if args.upsample_depth:
-                    target_intrinsic = intrinsic[next_idx]
-                else:
-                    target_intrinsic = intrinsic_for_output(
-                        intrinsic[next_idx], preprocess_metas[next_idx], resize_size
-                    )
-                proj_mat = build_projection_matrix(
-                    target_intrinsic, render_width, render_height
-                )
-                fov_y = 2.0 * np.arctan(0.5 * render_height / target_intrinsic[1, 1])
-
-                model_render = renderer.render(
-                    points, colors, confidences, view_mat, proj_mat, fov_y
-                )
-                if args.upsample_depth or resize_size is not None:
-                    splats_image = model_render
-                else:
-                    splats_image = restore_to_original_resolution(
-                        model_render, preprocess_metas[next_idx], args.preprocess_mode
-                    )
-
-                splats_path = forward_splats_path
-                target_path = forward_target_path
-                reference_path = forward_reference_path
-
-                if not splats_path.exists():
-                    Image.fromarray(splats_image).save(splats_path, **save_kwargs)
-
-                if args.save_confidence and not forward_conf_path.exists():
-                    # Save confidence map for the source frame (idx) as grayscale
-                    conf_for_save = conf_frame.copy()
-                    # Normalize to 0-255 range
-                    conf_min = conf_for_save.min()
-                    conf_max = conf_for_save.max()
-                    if conf_max > conf_min:
-                        conf_normalized = (conf_for_save - conf_min) / (conf_max - conf_min)
-                    else:
-                        conf_normalized = np.zeros_like(conf_for_save)
-                    conf_uint8 = (conf_normalized * 255).astype(np.uint8)
-                    if not args.upsample_depth and resize_size is None:
-                        # Restore to original resolution
-                        conf_image = Image.fromarray(conf_uint8, mode="L")
-                        meta = preprocess_metas[idx]
-                        left = int(meta["total_pad_left"])
-                        top = int(meta["total_pad_top"])
-                        right = left + int(meta["effective_width"])
-                        bottom = top + int(meta["effective_height"])
-                        conf_image = conf_image.crop((left, top, right, bottom))
-                        conf_image = conf_image.resize(
-                            (int(meta["orig_width"]), int(meta["orig_height"])),
-                            Image.Resampling.BICUBIC,
-                        )
-                    else:
-                        conf_image = Image.fromarray(conf_uint8, mode="L")
-                        if resize_size is not None:
-                            conf_image = conf_image.resize(resize_size, Image.Resampling.BICUBIC)
-                    # Always save confidence as PNG for lossless grayscale
-                    conf_image.save(forward_conf_path)
-                
-                if not target_path.exists() or not reference_path.exists():
-                    target_image = Image.open(image_paths[next_idx])
-                    reference_image = Image.open(image_paths[idx])
-                    try:
-                        target_image = target_image.convert("RGB")
-                        reference_image = reference_image.convert("RGB")
-                        if resize_size is not None:
-                            target_image = target_image.resize(
-                                resize_size, Image.Resampling.BICUBIC
-                            )
-                            reference_image = reference_image.resize(
-                                resize_size, Image.Resampling.BICUBIC
-                            )
-                        if not target_path.exists():
-                            target_image.save(target_path, **save_kwargs)
-                        if not reference_path.exists():
-                            reference_image.save(reference_path, **save_kwargs)
-                    finally:
-                        target_image.close()
-                        reference_image.close()
-
-                # Save PLY file if requested
-                if args.save_ply and not forward_ply_path.exists():
-                    write_ply(forward_ply_path, points, colors, confidences if args.save_confidence else None)
-                
-                ply_note = f" and {next_name}_reference.ply" if args.save_ply else ""
-                print(
-                    f"Wrote {scene_dir.name}/{splats_path.name}, {target_path.name}, "
-                    f"and {reference_path.name}{ply_note}"
-                )
-            else:
-                print(
-                    f"Skipped {scene_dir.name}/{next_name}_* (forward direction already complete)"
+            # Reverse: next_idx -> idx
+            if args.bidirectional:
+                render_and_save_pair(
+                    next_idx,
+                    idx,
+                    image_paths,
+                    scene_output_dir,
+                    output_ext,
+                    save_kwargs,
+                    args,
+                    depth,
+                    depth_conf,
+                    world_points,
+                    images_np,
+                    extrinsic,
+                    intrinsic,
+                    preprocess_metas,
+                    renderer,
+                    render_width,
+                    render_height,
+                    resize_size,
+                    skyseg_session,
                 )
 
-            # ========== Reverse direction: next_idx -> idx (B -> A) ==========
-            if not args.bidirectional:
-                continue
-            
-            # Check which files are missing for reverse direction
-            reverse_splats_path = scene_output_dir / f"{curr_name}_splats.{output_ext}"
-            reverse_target_path = scene_output_dir / f"{curr_name}_target.{output_ext}"
-            reverse_reference_path = scene_output_dir / f"{curr_name}_reference.{output_ext}"
-            reverse_conf_path = scene_output_dir / f"{curr_name}_confidence.png"
-            reverse_ply_path = scene_output_dir / f"{curr_name}_reference.ply"
-            
-            reverse_missing = (
-                not reverse_splats_path.exists() or 
-                not reverse_target_path.exists() or 
-                not reverse_reference_path.exists() or
-                (args.save_confidence and not reverse_conf_path.exists()) or
-                (args.save_ply and not reverse_ply_path.exists())
-            )
-            
-            if not reverse_missing:
-                print(
-                    f"Skipped {scene_dir.name}/{curr_name}_* (reverse direction already complete)"
-                )
-                continue
-            
-            depth_frame_rev = depth[next_idx]
-            conf_frame_rev = depth_conf[next_idx]
-            if depth_frame_rev.ndim == 3:
-                depth_frame_rev = depth_frame_rev.squeeze(-1)
-            if conf_frame_rev.ndim == 3:
-                conf_frame_rev = conf_frame_rev.squeeze(-1)
-            
-            # Apply sky filtering if enabled
-            if args.filter_sky and skyseg_session is not None:
-                sky_masks_dir = scene_output_dir / "sky_masks"
-                conf_frame_rev = apply_sky_filter(
-                    conf_frame_rev, image_paths[next_idx], skyseg_session, sky_masks_dir
-                )
-            
-            valid_mask_rev = depth_frame_rev > 1e-6
-
-            points_rev = world_points[next_idx][valid_mask_rev]
-            colors_rev = images_np[next_idx][valid_mask_rev]
-            confidences_rev = conf_frame_rev[valid_mask_rev]
-            
-            # Apply background filtering if enabled
-            if args.filter_black_bg or args.filter_white_bg:
-                bg_mask_rev = apply_background_filters(
-                    colors_rev, args.filter_black_bg, args.filter_white_bg
-                )
-                points_rev = points_rev[bg_mask_rev]
-                colors_rev = colors_rev[bg_mask_rev]
-                confidences_rev = confidences_rev[bg_mask_rev]
-
-            if args.auto_s0:
-                s0_rev = estimate_s0_from_depth(depth_frame_rev, intrinsic[next_idx])
-                if s0_rev > 0.0:
-                    renderer.s0 = s0_rev
-
-            view_mat_rev = build_view_matrix(extrinsic[idx])
-            if args.upsample_depth:
-                target_intrinsic_rev = intrinsic[idx]
-            else:
-                target_intrinsic_rev = intrinsic_for_output(
-                    intrinsic[idx], preprocess_metas[idx], resize_size
-                )
-            proj_mat_rev = build_projection_matrix(
-                target_intrinsic_rev, render_width, render_height
-            )
-            fov_y_rev = 2.0 * np.arctan(0.5 * render_height / target_intrinsic_rev[1, 1])
-
-            model_render_rev = renderer.render(
-                points_rev, colors_rev, confidences_rev, view_mat_rev, proj_mat_rev, fov_y_rev
-            )
-            if args.upsample_depth or resize_size is not None:
-                splats_image_rev = model_render_rev
-            else:
-                splats_image_rev = restore_to_original_resolution(
-                    model_render_rev, preprocess_metas[idx], args.preprocess_mode
-                )
-
-            splats_path_rev = reverse_splats_path
-            target_path_rev = reverse_target_path
-            reference_path_rev = reverse_reference_path
-
-            if not splats_path_rev.exists():
-                Image.fromarray(splats_image_rev).save(splats_path_rev, **save_kwargs)
-
-            if args.save_confidence and not reverse_conf_path.exists():
-                # Save confidence map for the source frame (next_idx) as grayscale
-                conf_for_save_rev = conf_frame_rev.copy()
-                # Normalize to 0-255 range
-                conf_min_rev = conf_for_save_rev.min()
-                conf_max_rev = conf_for_save_rev.max()
-                if conf_max_rev > conf_min_rev:
-                    conf_normalized_rev = (conf_for_save_rev - conf_min_rev) / (conf_max_rev - conf_min_rev)
-                else:
-                    conf_normalized_rev = np.zeros_like(conf_for_save_rev)
-                conf_uint8_rev = (conf_normalized_rev * 255).astype(np.uint8)
-                if not args.upsample_depth and resize_size is None:
-                    # Restore to original resolution
-                    conf_image_rev = Image.fromarray(conf_uint8_rev, mode="L")
-                    meta_rev = preprocess_metas[next_idx]
-                    left_rev = int(meta_rev["total_pad_left"])
-                    top_rev = int(meta_rev["total_pad_top"])
-                    right_rev = left_rev + int(meta_rev["effective_width"])
-                    bottom_rev = top_rev + int(meta_rev["effective_height"])
-                    conf_image_rev = conf_image_rev.crop((left_rev, top_rev, right_rev, bottom_rev))
-                    conf_image_rev = conf_image_rev.resize(
-                        (int(meta_rev["orig_width"]), int(meta_rev["orig_height"])),
-                        Image.Resampling.BICUBIC,
-                    )
-                else:
-                    conf_image_rev = Image.fromarray(conf_uint8_rev, mode="L")
-                    if resize_size is not None:
-                        conf_image_rev = conf_image_rev.resize(resize_size, Image.Resampling.BICUBIC)
-                # Always save confidence as PNG for lossless grayscale
-                conf_image_rev.save(reverse_conf_path)
-
-            if not target_path_rev.exists() or not reference_path_rev.exists():
-                target_image_rev = Image.open(image_paths[idx])
-                reference_image_rev = Image.open(image_paths[next_idx])
-                try:
-                    target_image_rev = target_image_rev.convert("RGB")
-                    reference_image_rev = reference_image_rev.convert("RGB")
-                    if resize_size is not None:
-                        target_image_rev = target_image_rev.resize(
-                            resize_size, Image.Resampling.BICUBIC
-                        )
-                        reference_image_rev = reference_image_rev.resize(
-                            resize_size, Image.Resampling.BICUBIC
-                        )
-                    if not target_path_rev.exists():
-                        target_image_rev.save(target_path_rev, **save_kwargs)
-                    if not reference_path_rev.exists():
-                        reference_image_rev.save(reference_path_rev, **save_kwargs)
-                finally:
-                    target_image_rev.close()
-                    reference_image_rev.close()
-
-            # Save PLY file if requested
-            if args.save_ply and not reverse_ply_path.exists():
-                write_ply(reverse_ply_path, points_rev, colors_rev, confidences_rev if args.save_confidence else None)
-            
-            ply_note_rev = f" and {curr_name}_reference.ply" if args.save_ply else ""
-            print(
-                f"Wrote {scene_dir.name}/{splats_path_rev.name}, {target_path_rev.name}, "
-                f"and {reference_path_rev.name}{ply_note_rev}"
-            )
-
+        # Explicit cleanup
         del images
         del predictions
         del depth
@@ -1455,10 +1340,82 @@ def main() -> None:
         del preprocess_metas
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        
+
+    finally:
         # Clean up temporary rescaled images
         if temp_resized_dir is not None and temp_resized_dir.exists():
             shutil.rmtree(temp_resized_dir)
+
+
+def main() -> None:
+    args = parse_args()
+    input_dir = args.input_dir
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if (args.resize_width == 0) != (args.resize_height == 0):
+        raise ValueError("Both resize width and height must be set or both 0.")
+    resize_size = None
+    if args.resize_width > 0 and args.resize_height > 0:
+        resize_size = (args.resize_width, args.resize_height)
+        resize_megapixels = (resize_size[0] * resize_size[1]) / 1_000_000
+        if args.max_megapixels > 0 and resize_megapixels > args.max_megapixels:
+            scale = (args.max_megapixels / resize_megapixels) ** 0.5
+            resize_size = (
+                max(1, int(round(resize_size[0] * scale))),
+                max(1, int(round(resize_size[1] * scale))),
+            )
+            print(
+                f"Rescaling resize-size to honor max megapixels: {resize_size[0]}x{resize_size[1]}"
+            )
+
+    scene_dirs = list_scene_dirs(input_dir)
+    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_name)
+    dtype = (
+        torch.bfloat16
+        if device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8
+        else torch.float16
+    )
+
+    model = load_model(device)
+    renderer_info = {
+        "renderer": None,
+        "renderer_size": None,
+        "shaders_dir": Path(__file__).resolve().parent / "shaders",
+    }
+
+    # Initialize sky segmentation if needed
+    skyseg_session = None
+    if args.filter_sky:
+        if not SKY_FILTER_AVAILABLE:
+            print(
+                "Warning: --filter-sky requires opencv-python and onnxruntime. Install with:"
+            )
+            print("  uv pip install opencv-python onnxruntime")
+            print("Sky filtering will be disabled.")
+        else:
+            skyseg_path = Path("skyseg.onnx")
+            if not skyseg_path.exists():
+                print("Downloading sky segmentation model...")
+                download_file_from_url(
+                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
+                    "skyseg.onnx",
+                )
+            skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
+
+    for scene_dir in scene_dirs:
+        process_scene(
+            scene_dir,
+            args,
+            model,
+            device,
+            dtype,
+            renderer_info,
+            skyseg_session,
+            output_dir,
+            resize_size,
+        )
 
 
 if __name__ == "__main__":
