@@ -2,6 +2,7 @@
 """Test script to verify triplet detection in aitoolkit and modelscope scripts."""
 
 from pathlib import Path
+import pytest
 
 def find_triplets_in_scene(scene_dir: Path) -> list[dict]:
     """Find all triplets in a scene directory."""
@@ -41,50 +42,52 @@ def find_triplets_in_scene(scene_dir: Path) -> list[dict]:
     
     return complete_triplets
 
-def test_triplet_detection():
-    """Test the triplet detection logic."""
+def test_triplet_detection(tmp_path):
+    """Test the triplet detection logic using a temporary directory."""
     
-    scene_dir = Path("output/01")
+    scene_dir = tmp_path / "scene_01"
+    scene_dir.mkdir()
     
-    print("Testing Triplet Detection")
-    print("=" * 70)
-    print(f"Scene: {scene_dir}")
-    print()
+    # 1. Create a complete triplet
+    (scene_dir / "img1_splats.jpg").write_text("dummy")
+    (scene_dir / "img1_reference.jpg").write_text("dummy")
+    (scene_dir / "img1_target.jpg").write_text("dummy")
     
-    # List all files in the scene
-    print("Files in scene:")
-    for file_path in sorted(scene_dir.iterdir()):
-        if file_path.is_file():
-            print(f"  {file_path.name}")
+    # 2. Create an incomplete triplet (missing target)
+    (scene_dir / "img2_splats.jpg").write_text("dummy")
+    (scene_dir / "img2_reference.jpg").write_text("dummy")
     
-    print()
-    print("=" * 70)
+    # 3. Create another complete triplet with different extension
+    (scene_dir / "img3_splats.png").write_text("dummy")
+    (scene_dir / "img3_reference.png").write_text("dummy")
+    (scene_dir / "img3_target.png").write_text("dummy")
+
+    # 4. Create distractor files
+    (scene_dir / "img1_reference.ply").write_text("dummy")
+    (scene_dir / "notes.txt").write_text("dummy")
     
     # Find triplets
     triplets = find_triplets_in_scene(scene_dir)
     
-    print(f"\nFound {len(triplets)} complete triplet(s):")
-    print()
+    # Assertions
+    assert len(triplets) == 2
     
-    for i, files in enumerate(triplets, 1):
-        print(f"Triplet {i} (stem: {files['stem']}):")
-        print(f"  Splats:    {files['splats'].name}")
-        print(f"  Reference: {files['reference'].name}")
-        print(f"  Target:    {files['target'].name}")
-        print()
+    # Verify first triplet
+    assert triplets[0]["stem"] == "img1"
+    assert triplets[0]["splats"].name == "img1_splats.jpg"
+    assert triplets[0]["reference"].name == "img1_reference.jpg"
+    assert triplets[0]["target"].name == "img1_target.jpg"
     
-    print("=" * 70)
-    print("\nExpected behavior:")
-    print("  - With current forward-only data: Should find 1 triplet")
-    print("  - With bidirectional data: Should find 2 triplets")
-    print(f"\nActual result: Found {len(triplets)} triplet(s)")
-    
-    if len(triplets) == 1:
-        print("✓ Correct! (forward-only dataset)")
-    elif len(triplets) == 2:
-        print("✓ Correct! (bidirectional dataset)")
-    else:
-        print("✗ Unexpected number of triplets")
+    # Verify second triplet
+    assert triplets[1]["stem"] == "img3"
+    assert triplets[1]["splats"].name == "img3_splats.png"
+    assert triplets[1]["reference"].name == "img3_reference.png"
+    assert triplets[1]["target"].name == "img3_target.png"
 
 if __name__ == "__main__":
-    test_triplet_detection()
+    # Allow running as a script
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_triplet_detection(Path(tmpdir))
+        print("✓ test_triplet_detection passed!")
