@@ -17,6 +17,29 @@ class RenderPass:
 
 
 class HoleFillingRenderer:
+    """GPU-accelerated renderer for point clouds with hierarchical hole filling.
+
+    This renderer converts 3D point clouds into 2D images using a multi-pass pipeline
+    implemented with ModernGL. It handles occlusions and fills holes caused by
+    sparsity or disocclusions in the point cloud.
+
+    The rendering pipeline consists of several key stages:
+    1.  **Points Pass**: Initial rendering of 3D points into multiple textures:
+        color, camera-space positions, and world-space positions.
+    2.  **Downsample Passes**: Creates a multi-scale pyramid of the rendered textures.
+    3.  **HPR (Hidden Point Removal)**: A visibility estimation pass that determines
+        which points are occluded by others, based on their density and distance.
+    4.  **JFA (Jump Flooding Algorithm)**: Computes a distance transform and nearest-
+        neighbor field to provide smooth masks for hole filling.
+    5.  **Push-Pull**: A hierarchical algorithm that fills holes by "pushing" valid
+        colors to coarser levels and "pulling" them back to fill gaps at finer levels.
+    6.  **Final Mask**: Blends the original points with the hole-filled result using
+        the JFA-computed distance mask.
+
+    Attributes:
+        max_level (int): Maximum depth of the image pyramid for push-pull.
+    """
+
     max_level = 8
 
     def __init__(
@@ -30,6 +53,19 @@ class HoleFillingRenderer:
         coarse_level: int = 4,
         jfa_mask_sigma: float = 32.0,
     ) -> None:
+        """Initializes the renderer and its GPU resources.
+
+        Args:
+            width: Output image width in pixels.
+            height: Output image height in pixels.
+            shaders_dir: Directory containing the GLSL shader files.
+                Defaults to a "shaders" subdirectory relative to this file.
+            confidence_threshold: Minimum depth confidence required to render a point.
+            s0: Base splat size parameter used for HPR and rendering.
+            occlusion_threshold: Threshold for determining if a point is occluded in HPR.
+            coarse_level: The level in the pyramid where hole filling starts being aggressive.
+            jfa_mask_sigma: Sigma for the Gaussian falloff of the JFA-based hole filling mask.
+        """
         self.width = int(width)
         self.height = int(height)
         self.confidence_threshold = float(confidence_threshold)
@@ -120,6 +156,19 @@ class HoleFillingRenderer:
         proj_mat: np.ndarray,
         fov_y: float,
     ) -> np.ndarray:
+        """Renders a point cloud into a 2D image from a specific viewpoint.
+
+        Args:
+            points: Nx3 array of 3D point coordinates (float32).
+            colors: Nx3 array of RGB colors in [0, 1] range (float32).
+            confidences: Nx1 array of depth confidence values (float32).
+            view_mat: 4x4 camera view matrix (world-to-camera).
+            proj_mat: 4x4 camera projection matrix.
+            fov_y: Vertical field of view in radians.
+
+        Returns:
+            H x W x 3 numpy array containing the rendered RGB image (uint8, 0-255).
+        """
         if points.size == 0:
             return np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
@@ -156,6 +205,7 @@ class HoleFillingRenderer:
             conf_buffer.release()
 
     def _load_program(self, vert_path: Path, frag_path: Path) -> moderngl.Program:
+        """Loads and compiles a ModernGL program from vertex and fragment shader files."""
         return self.ctx.program(
             vertex_shader=vert_path.read_text(encoding="utf-8"),
             fragment_shader=frag_path.read_text(encoding="utf-8"),
@@ -164,12 +214,14 @@ class HoleFillingRenderer:
     def _load_program_from_source(
         self, vertex_source: str, frag_path: Path
     ) -> moderngl.Program:
+        """Loads and compiles a ModernGL program from a vertex source string and fragment file."""
         return self.ctx.program(
             vertex_shader=vertex_source,
             fragment_shader=frag_path.read_text(encoding="utf-8"),
         )
 
     def _init_points_pass(self) -> RenderPass:
+        """Initializes the first pass which renders the raw point cloud data."""
         color = self._create_texture((self.width, self.height), 4, "f4")
         cam_pos = self._create_texture((self.width, self.height), 4, "f4")
         world_pos = self._create_texture((self.width, self.height), 4, "f4")
@@ -184,6 +236,7 @@ class HoleFillingRenderer:
         )
 
     def _init_downsample_passes(self) -> list[RenderPass]:
+        """Initializes hierarchical downsampling passes for the push-pull algorithm."""
         passes: list[RenderPass] = []
         cur_width = self.width // 2
         cur_height = self.height // 2
@@ -222,12 +275,14 @@ class HoleFillingRenderer:
         )
 
     def _init_push_passes(self) -> list[RenderPass]:
+        """Initializes FBOs for the 'push' (downsampling) phase of hole filling."""
         return [
             self._init_single_pass(pass_.width, pass_.height, [(4, "f4")])
             for pass_ in self.downsample_passes
         ]
 
     def _init_pull_passes(self) -> list[RenderPass]:
+        """Initializes FBOs for the 'pull' (upsampling/interpolation) phase of hole filling."""
         passes: list[RenderPass] = []
         for idx, _ in enumerate(self.downsample_passes):
             if idx == 0:
@@ -298,6 +353,7 @@ class HoleFillingRenderer:
     def _render_points_pass(
         self, vao: moderngl.VertexArray, view_mat: np.ndarray, proj_mat: np.ndarray
     ) -> None:
+        """Executes the initial point rendering pass."""
         self.points_pass.fbo.use()
         self.ctx.viewport = (0, 0, self.points_pass.width, self.points_pass.height)
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -341,6 +397,11 @@ class HoleFillingRenderer:
             prev_depth = pass_.depth_texture
 
     def _render_hpr_pass(self, fov_y: float) -> None:
+        """Executes Hidden Point Removal to determine point visibility.
+
+        HPR estimates which points are visible from the camera by checking if they
+        lie on the 'convex hull' of the point cloud transformed by a spherical inversion.
+        """
         self.hpr_pass.fbo.use()
         self.ctx.viewport = (0, 0, self.hpr_pass.width, self.hpr_pass.height)
         self.ctx.disable(moderngl.DEPTH_TEST)
@@ -405,6 +466,11 @@ class HoleFillingRenderer:
         quad.render(mode=moderngl.TRIANGLE_STRIP)
 
     def _render_jfa_passes(self) -> None:
+        """Executes Jump Flooding Algorithm to compute distance transform.
+
+        JFA is an efficient GPU algorithm for computing Voronoi diagrams and distance
+        transforms by iteratively 'jumping' and updating the nearest seed position.
+        """
         self.jfa_init_pass.fbo.use()
         self.ctx.viewport = (0, 0, self.jfa_init_pass.width, self.jfa_init_pass.height)
         self.ctx.disable(moderngl.DEPTH_TEST)
