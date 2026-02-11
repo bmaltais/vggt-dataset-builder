@@ -196,8 +196,6 @@ def write_ply(
         colors: Nx3 array of RGB colors (0-1 range)
         confidences: Optional Nx1 array of confidence values
     """
-    import struct
-    
     num_points = points.shape[0]
     
     # Convert colors from 0-1 to 0-255 range
@@ -221,16 +219,28 @@ def write_ply(
         # Write header
         f.write(header.encode('ascii'))
         
-        # Write vertex data in binary
-        for i in range(num_points):
-            x, y, z = points[i]
-            r, g, b = colors_uint8[i]
-            # Pack: 3 floats (x,y,z) + 3 unsigned chars (r,g,b)
-            data = struct.pack('fffBBB', x, y, z, r, g, b)
-            if confidences is not None:
-                # Add confidence as float
-                data += struct.pack('f', confidences[i])
-            f.write(data)
+        # ⚡ Bolt: Bulk binary writing with NumPy structured array
+        # This is significantly faster than a Python loop with struct.pack
+        # for large point clouds (e.g. 1M points).
+        dtype = [
+            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
+        ]
+        if confidences is not None:
+            dtype.append(('confidence', '<f4'))
+
+        vertex_data = np.empty(num_points, dtype=dtype)
+        vertex_data['x'] = points[:, 0]
+        vertex_data['y'] = points[:, 1]
+        vertex_data['z'] = points[:, 2]
+        vertex_data['red'] = colors_uint8[:, 0]
+        vertex_data['green'] = colors_uint8[:, 1]
+        vertex_data['blue'] = colors_uint8[:, 2]
+        if confidences is not None:
+            # Handle both (N,) and (N, 1) confidence arrays
+            vertex_data['confidence'] = confidences.ravel()
+
+        f.write(vertex_data.tobytes())
 
 
 def apply_sky_filter(
@@ -279,16 +289,19 @@ def apply_background_filters(
         Boolean mask of valid points
     """
     mask = np.ones(colors.shape[0], dtype=bool)
-    
+    if not (filter_black or filter_white):
+        return mask
+
+    # ⚡ Bolt: Use float comparisons directly to avoid expensive uint8 conversions
+    # and redundant computations for black/white filtering.
     if filter_black:
-        # Filter out black background (RGB sum < 16/255 in 0-1 range)
-        colors_255 = (colors * 255).astype(np.uint8)
-        mask &= (colors_255.sum(axis=1) >= 16)
+        # RGB sum < 16/255 approx 0.0627 in 0-1 float range
+        mask &= (colors.sum(axis=1) >= (16 / 255.0))
     
     if filter_white:
-        # Filter out white background (all RGB > 240/255)
-        colors_255 = (colors * 255).astype(np.uint8)
-        mask &= ~((colors_255[:, 0] > 240) & (colors_255[:, 1] > 240) & (colors_255[:, 2] > 240))
+        # RGB > 240/255 approx 0.9412 in 0-1 float range
+        threshold = 240 / 255.0
+        mask &= ~((colors[:, 0] > threshold) & (colors[:, 1] > threshold) & (colors[:, 2] > threshold))
     
     return mask
 
@@ -732,12 +745,16 @@ def estimate_s0_from_depth(
     valid = depth_map > eps
     if not np.any(valid):
         return 0.0
+
+    # ⚡ Bolt: Only compute spacing for valid points to avoid unnecessary calculations
+    # on the entire depth map.
+    valid_depths = depth_map[valid]
     fx = float(intrinsic[0, 0])
     fy = float(intrinsic[1, 1])
-    dx = depth_map / max(fx, eps)
-    dy = depth_map / max(fy, eps)
+    dx = valid_depths / max(fx, eps)
+    dy = valid_depths / max(fy, eps)
     spacing = np.sqrt(dx * dx + dy * dy)
-    return float(np.median(spacing[valid]))
+    return float(np.median(spacing))
 
 
 def build_projection_matrix(
