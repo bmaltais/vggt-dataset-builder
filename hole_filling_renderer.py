@@ -140,8 +140,10 @@ class HoleFillingRenderer:
         )
         self.push_color_passes = self._init_push_passes()
         self.pull_color_passes = self._init_pull_passes()
+        # ⚡ Bolt: Use a 3-component uint8 texture for the final pass to speed up readback.
+        # This reduces data transfer from GPU by 4x+ and avoids expensive CPU-side conversions.
         self.final_mask_pass = self._init_single_pass(
-            self.width, self.height, [(4, "f4")]
+            self.width, self.height, [(3, "u1")]
         )
         self.jfa_init_pass = self._init_jfa_seed_pass()
         self.jfa_step_passes = [self._init_jfa_seed_pass(), self._init_jfa_seed_pass()]
@@ -600,12 +602,14 @@ class HoleFillingRenderer:
         quad.render(mode=moderngl.TRIANGLE_STRIP)
 
     def _read_final_color(self) -> np.ndarray:
+        # ⚡ Bolt: Fast uint8 readback.
+        # Since all processing (alpha premultiplication, masking, scaling) is now done
+        # on the GPU and rendered into a uint8 texture, we can just read the bytes
+        # and reshape. This is significantly faster than CPU-side float math.
         texture = self.final_mask_pass.color_textures[0]
         data = texture.read()
-        rgba = np.frombuffer(data, dtype=np.float32).reshape(
-            (texture.height, texture.width, 4)
+        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
+            (texture.height, texture.width, 3)
         )
-        rgba = np.flipud(rgba)
-        rgba = np.clip(rgba, 0.0, 1.0)
-        rgb = rgba[..., :3] * rgba[..., 3:4]
-        return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        # OpenGL origin is bottom-left, so we flip to match image convention (top-left).
+        return np.flipud(rgb)

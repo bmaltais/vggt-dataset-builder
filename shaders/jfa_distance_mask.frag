@@ -11,7 +11,11 @@ void main(void) {
 	float dist = texelFetch(u_tex_dist, coord, 0).x;
 	float sigma = max(u_sigma, 0.0001);
 	float normalized = dist / sigma;
-	float gaussian = exp(-0.5 * normalized * normalized);
-	float factor = gaussian;
-	o_dest = texelFetch(u_tex_source, coord, 0) * factor;
+	float factor = exp(-0.5 * normalized * normalized);
+
+	vec4 sample_source = texelFetch(u_tex_source, coord, 0);
+	// ⚡ Bolt: Perform alpha premultiplication and distance masking on the GPU.
+	// We use factor * factor to match the original CPU-side behavior where factor
+	// was effectively applied twice (once in shader, once during alpha multiplication).
+	o_dest = vec4(sample_source.xyz * sample_source.w * factor * factor, 1.0);
 }
