@@ -782,6 +782,30 @@ def build_projection_matrix(
     return proj
 
 
+def get_triplet_paths(
+    scene_output_dir: Path,
+    stem: str,
+    output_ext: str,
+) -> dict[str, Path]:
+    """Generate paths for all output files in a triplet.
+
+    Args:
+        scene_output_dir: Path to scene output directory
+        stem: Base name for the target frame
+        output_ext: Extension for image files (jpg, png, etc.)
+
+    Returns:
+        Dictionary mapping file types to Path objects
+    """
+    return {
+        "splats": scene_output_dir / f"{stem}_splats.{output_ext}",
+        "target": scene_output_dir / f"{stem}_target.{output_ext}",
+        "reference": scene_output_dir / f"{stem}_reference.{output_ext}",
+        "confidence": scene_output_dir / f"{stem}_confidence.png",
+        "ply": scene_output_dir / f"{stem}_reference.ply",
+    }
+
+
 def check_scene_needs_processing(
     scene_dir: Path,
     output_dir: Path,
@@ -807,48 +831,27 @@ def check_scene_needs_processing(
         curr_name = image_paths[idx].stem
         
         # Check both original and rescaled versions of the filename
-        def files_exist_for_name(name: str, direction: str) -> bool:
-            # Check with original name
-            splats = scene_output_dir / f"{name}_splats.{output_ext}"
-            target = scene_output_dir / f"{name}_target.{output_ext}"
-            reference = scene_output_dir / f"{name}_reference.{output_ext}"
-            conf = scene_output_dir / f"{name}_confidence.png"
-            ply = scene_output_dir / f"{name}_reference.ply"
-            
-            files_ok = (
-                splats.exists() and 
-                target.exists() and 
-                reference.exists() and
-                (not save_confidence or conf.exists()) and
-                (not save_ply or ply.exists())
-            )
-            
-            if files_ok:
-                return True
-            
-            # Check with _rescaled variant
-            rescaled_name = f"{name}_rescaled"
-            splats = scene_output_dir / f"{rescaled_name}_splats.{output_ext}"
-            target = scene_output_dir / f"{rescaled_name}_target.{output_ext}"
-            reference = scene_output_dir / f"{rescaled_name}_reference.{output_ext}"
-            conf = scene_output_dir / f"{rescaled_name}_confidence.png"
-            ply = scene_output_dir / f"{rescaled_name}_reference.ply"
-            
-            return (
-                splats.exists() and 
-                target.exists() and 
-                reference.exists() and
-                (not save_confidence or conf.exists()) and
-                (not save_ply or ply.exists())
-            )
+        def files_exist_for_name(name: str) -> bool:
+            for stem in [name, f"{name}_rescaled"]:
+                paths = get_triplet_paths(scene_output_dir, stem, output_ext)
+                files_ok = (
+                    paths["splats"].exists() and
+                    paths["target"].exists() and
+                    paths["reference"].exists() and
+                    (not save_confidence or paths["confidence"].exists()) and
+                    (not save_ply or paths["ply"].exists())
+                )
+                if files_ok:
+                    return True
+            return False
         
         # Check forward direction files
-        if not files_exist_for_name(next_name, "forward"):
+        if not files_exist_for_name(next_name):
             return True  # Forward direction needs work
         
         # Check reverse direction if bidirectional
         if bidirectional:
-            if not files_exist_for_name(curr_name, "reverse"):
+            if not files_exist_for_name(curr_name):
                 return True  # Reverse direction needs work
     
     return False  # All pairs complete
@@ -911,12 +914,13 @@ def render_and_save_pair(
 ) -> None:
     """Render and save a single image pair (source -> target)."""
     target_name = image_paths[target_idx].stem
+    paths = get_triplet_paths(scene_output_dir, target_name, output_ext)
 
-    splats_path = scene_output_dir / f"{target_name}_splats.{output_ext}"
-    target_path = scene_output_dir / f"{target_name}_target.{output_ext}"
-    reference_path = scene_output_dir / f"{target_name}_reference.{output_ext}"
-    conf_path = scene_output_dir / f"{target_name}_confidence.png"
-    ply_path = scene_output_dir / f"{target_name}_reference.ply"
+    splats_path = paths["splats"]
+    target_path = paths["target"]
+    reference_path = paths["reference"]
+    conf_path = paths["confidence"]
+    ply_path = paths["ply"]
 
     missing = (
         not splats_path.exists()
