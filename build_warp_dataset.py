@@ -301,7 +301,7 @@ def apply_background_filters(
     
     if filter_white:
         # ⚡ Bolt: floor(c * 255) > 240  <=>  c * 255 >= 241  <=>  c >= 241/255
-        # This avoid creating an expensive floor copy and multiple mask arrays.
+        # This avoids creating an expensive floor copy and multiple mask arrays.
         threshold = 241.0 / 255.0
         mask &= ~((colors[:, 0] >= threshold) & (colors[:, 1] >= threshold) & (colors[:, 2] >= threshold))
     
