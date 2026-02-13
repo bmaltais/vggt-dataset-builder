@@ -13,3 +13,7 @@
 ## 2026-02-12 - [Optimized Background Filtering]
 **Learning:** `np.floor(colors * 255.0) > 240` can be mathematically simplified to `colors >= 241/255.0`. This avoids creating a full-size float32 copy of the array and multiple intermediate boolean masks, reducing memory pressure and improving execution speed by ~20%.
 **Action:** Simplify image thresholding math to avoid redundant array allocations.
+
+## 2026-02-12 - [Redundant Point Cloud Extraction]
+**Learning:** In bidirectional rendering pipelines, each frame is often used as a source for multiple target views. Performing point cloud extraction, sky filtering, and background masking repeatedly for the same source frame adds massive redundant overhead in NumPy indexing and I/O.
+**Action:** Pre-calculate and cache filtered point cloud data once per frame; delete original large arrays immediately to minimize peak memory usage.
