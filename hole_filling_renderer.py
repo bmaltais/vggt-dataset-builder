@@ -52,6 +52,7 @@ class HoleFillingRenderer:
         occlusion_threshold: float = 0.1,
         coarse_level: int = 4,
         jfa_mask_sigma: float = 32.0,
+        ctx: moderngl.Context | None = None,
     ) -> None:
         """Initializes the renderer and its GPU resources.
 
@@ -74,7 +75,8 @@ class HoleFillingRenderer:
         self.coarse_level = int(coarse_level)
         self.jfa_mask_sigma = float(jfa_mask_sigma)
 
-        self.ctx = moderngl.create_standalone_context(require=410)
+        # Allow sharing an existing ModernGL context (useful for interactive viewers)
+        self.ctx = ctx or moderngl.create_standalone_context(require=410)
         self.ctx.point_size = 1.0
 
         if shaders_dir is None:
@@ -116,6 +118,19 @@ class HoleFillingRenderer:
         self.final_mask_program = self._load_program_from_source(
             quad_vertex, shaders_dir / "jfa_distance_mask.frag"
         )
+
+        # Simple blit program to draw a texture to the default framebuffer
+        blit_frag = """
+#version 330
+in vec2 v_tex_coord;
+uniform sampler2D u_tex;
+out vec4 f_color;
+void main() {
+    vec3 c = texture(u_tex, v_tex_coord).rgb;
+    f_color = vec4(c, 1.0);
+}
+"""
+        self.blit_program = self.ctx.program(vertex_shader=quad_vertex, fragment_shader=blit_frag)
 
         self._quad_pos_buffer = self.ctx.buffer(
             np.array(
@@ -198,6 +213,67 @@ class HoleFillingRenderer:
             self._render_push_pull_passes()
             self._render_final_mask()
             return self._read_final_color()
+        finally:
+            vao.release()
+            pos_buffer.release()
+            color_buffer.release()
+            conf_buffer.release()
+
+    def render_to_screen(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        confidences: np.ndarray,
+        view_mat: np.ndarray,
+        proj_mat: np.ndarray,
+        fov_y: float,
+    ) -> None:
+        """Render the point cloud directly into the current OpenGL default framebuffer.
+
+        This uses the renderer's ModernGL context and draws the final texture
+        to the screen without copying to CPU.
+        """
+        if points.size == 0:
+            return
+
+        points = np.asarray(points, dtype=np.float32)
+        colors = np.asarray(colors, dtype=np.float32)
+        confidences = np.asarray(confidences, dtype=np.float32).reshape(-1, 1)
+
+        pos_buffer = self.ctx.buffer(points.tobytes())
+        color_buffer = self.ctx.buffer(colors.tobytes())
+        conf_buffer = self.ctx.buffer(confidences.tobytes())
+
+        vao = self.ctx.vertex_array(
+            self.points_program,
+            [
+                (pos_buffer, "3f", "a_position"),
+                (color_buffer, "3f", "a_color"),
+                (conf_buffer, "1f", "a_confidence"),
+            ],
+        )
+
+        try:
+            self._render_points_pass(vao, view_mat, proj_mat)
+            self._render_downsample_passes()
+            self._render_hpr_pass(fov_y)
+            self._render_multiply_passes()
+            self._render_jfa_passes()
+            self._render_push_pull_passes()
+            self._render_final_mask()
+
+            # Bind default framebuffer (screen) and draw the final texture
+            try:
+                self.ctx.screen.use()
+            except Exception:
+                # fallback: use None
+                pass
+            self.ctx.viewport = (0, 0, self.width, self.height)
+            texture = self.final_mask_pass.color_textures[0]
+            texture.use(0)
+            self.blit_program["u_tex"].value = 0
+            quad = self._quad_vao(self.blit_program)
+            quad.render(mode=moderngl.TRIANGLE_STRIP)
         finally:
             vao.release()
             pos_buffer.release()
@@ -609,3 +685,10 @@ class HoleFillingRenderer:
         rgba = np.clip(rgba, 0.0, 1.0)
         rgb = rgba[..., :3] * rgba[..., 3:4]
         return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    def read_final_color(self) -> np.ndarray:
+        """Public wrapper that returns the final rendered RGB image as uint8.
+
+        This exists for convenience to match the viewer's expected API.
+        """
+        return self._read_final_color()

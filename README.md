@@ -238,6 +238,24 @@ uv run python aitoolkit.py --prompt "refer to image 2, fix the distortion and bl
 - `--output-dir <path>`: Input directory (default: output)
 - `--aitoolkit-dir <path>`: Output directory (default: aitoolkit-dataset)
 - `--prompt <text>`: Prompt text to save as `target/<N>.txt`
+
+## Viewer
+
+Run the interactive viewer (if `pyglet` is installed) or render a single image to disk:
+
+```bash
+uv run python vggt_point_cloud_viewer.py input/01/image1.jpg --output out.png
+```
+
+Supported options (subset): `--viewport-width`, `--viewport-height`, `--resize-width`, `--resize-height`, `--sigma`, `--auto-s0`, `--s0`, `--occlusion-threshold`, `--coarse-level`, `--conf-threshold`.
+
+The viewer will try to open an interactive window using `pyglet`. If `pyglet` is not installed or an interactive context cannot be created, the script falls back to rendering a single frame to an image using `HoleFillingRenderer`.
+
+To install the optional viewer dependencies:
+
+```bash
+uv pip install pyglet moderngl glcontext
+```
 - `--quiet`: Suppress progress output
 
 ## Command-Line Options
