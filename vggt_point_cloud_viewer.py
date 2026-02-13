@@ -575,6 +575,7 @@ def main() -> None:
             sigma,
             occlusion_threshold,
             coarse_level,
+            resizable: bool = True,
         ):
             if window_size is None:
                 width, height = int(model_size[0]), int(model_size[1])
@@ -584,7 +585,7 @@ def main() -> None:
                 width=width,
                 height=height,
                 caption="VGGT Point Cloud Viewer",
-                resizable=False,
+                resizable=resizable,
             )
             self.vertices = vertices
             self.rgb_colors = rgb_colors
@@ -631,8 +632,17 @@ def main() -> None:
             self.render_size: tuple[int, int] | None = None
             self.ctx: moderngl.Context | None = None
 
+            # Source aspect ratio (point-map width / height) — keep this fixed
+            self.source_aspect = float(self.model_size[0]) / max(float(self.model_size[1]), 1.0)
+            # Current full-window size (framebuffer) and computed sub-viewport (x,y,w,h)
+            self.window_size_current: tuple[int, int] = (width, height)
+            self._viewport: tuple[int, int, int, int] = (0, 0, width, height)
+
             self._reset_camera()
             self._init_gl()
+            # initialize viewport/projection for current framebuffer size
+            fb_w, fb_h = self.get_framebuffer_size()
+            self._update_viewport_and_projection(fb_w, fb_h)
             pyglet.clock.schedule_interval(self._update_camera, 1.0 / 60.0)
 
         def _save_current_frame(self):
@@ -683,18 +693,83 @@ def main() -> None:
         def _init_gl(self):
             gl.glClearColor(0.05, 0.06, 0.07, 1.0)
 
+        def _compute_intrinsic_preserve_vertical(self, intrinsic: np.ndarray, src_size: tuple[int, int], dst_size: tuple[int, int]) -> np.ndarray:
+            # Keep vertical FOV stable: scale by dst_h / src_h for fx and fy,
+            # adjust principal point relative to center so the view expands horizontally when wider.
+            if intrinsic is None:
+                # create a reasonable default pinhole with centered principal point
+                src_w, src_h = src_size
+                dst_w, dst_h = dst_size
+                fx = dst_h
+                fy = dst_h
+                cx = dst_w * 0.5
+                cy = dst_h * 0.5
+                K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+                return K
+            K = intrinsic.copy().astype(np.float32)
+            if K.ndim > 2:
+                K = K.squeeze()
+            src_w, src_h = int(src_size[0]), int(src_size[1])
+            dst_w, dst_h = int(dst_size[0]), int(dst_size[1])
+            scale = dst_h / max(src_h, 1)
+            fx = float(K[0, 0]) * scale
+            fy = float(K[1, 1]) * scale
+            # principal point offset from source center, then scaled
+            ox = float(K[0, 2]) - (src_w * 0.5)
+            oy = float(K[1, 2]) - (src_h * 0.5)
+            cx = (dst_w * 0.5) + ox * scale
+            cy = (dst_h * 0.5) + oy * scale
+            K2 = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+            return K2
+
+        def _compute_viewport(self, win_w: int, win_h: int) -> tuple[int, int, int, int]:
+            # For expand-to-fill behavior we use the full window as the viewport.
+            return (0, 0, max(int(win_w), 1), max(int(win_h), 1))
+
+        def _update_viewport_and_projection(self, win_w: int, win_h: int) -> None:
+            self.window_size_current = (win_w, win_h)
+            # For expand-to-fill, viewport is full framebuffer
+            vp = self._compute_viewport(win_w, win_h)
+            self._viewport = vp
+            # Mark renderer for recreation if framebuffer size changed
+            _, _, w, h = vp
+            if self.render_size != (w, h):
+                self.render_size = None
+            try:
+                gl.glViewport(vp[0], vp[1], vp[2], vp[3])
+            except Exception:
+                pass
+
+        def on_resize(self, width: int, height: int) -> None:
+            self._update_viewport_and_projection(width, height)
+            # Recreate renderer immediately to match new size
+            try:
+                self._ensure_renderer()
+            except Exception:
+                pass
+            return super().on_resize(width, height)
+
         def _ensure_renderer(self):
             self.switch_to()
             if self.ctx is None:
                 self.ctx = moderngl.create_context()
+            # Determine full framebuffer size or fixed render size
             if self.fixed_render_size is not None:
-                size = self.fixed_render_size
+                full_size = (int(self.fixed_render_size[0]), int(self.fixed_render_size[1]))
             else:
-                size = self.get_framebuffer_size()
-            if self.renderer is None or self.render_size != size:
+                full_size = self.get_framebuffer_size()
+            # Compute a centered sub-viewport that preserves the source aspect
+            vp = self._compute_viewport(full_size[0], full_size[1])
+            x, y, eff_w, eff_h = vp
+            try:
+                gl.glViewport(x, y, eff_w, eff_h)
+            except Exception:
+                pass
+
+            if self.renderer is None or self.render_size != (eff_w, eff_h):
                 self.renderer = HoleFillingRenderer(
-                    size[0],
-                    size[1],
+                    eff_w,
+                    eff_h,
                     shaders_dir=self.shaders_dir,
                     confidence_threshold=self.confidence_threshold,
                     jfa_mask_sigma=self.jfa_mask_sigma,
@@ -704,7 +779,7 @@ def main() -> None:
                 )
                 if self.s0_base > 0.0:
                     self.renderer.s0 = self.s0_base
-                self.render_size = size
+                self.render_size = (eff_w, eff_h)
             if self.renderer is not None:
                 self.renderer.ctx.point_size = float(self.point_size)
 
@@ -712,31 +787,28 @@ def main() -> None:
             colors = self.depth_colors if self.use_depth_colors else self.rgb_colors
             near = 0.01
             far = 10000.0
+            # Use the computed effective render size (preserves source aspect)
             if self.render_size is None:
-                render_width, render_height = self.get_framebuffer_size()
-            else:
-                render_width, render_height = self.render_size
+                # ensure renderer and viewport are set
+                self._ensure_renderer()
+            render_width, render_height = self.render_size if self.render_size is not None else self.get_framebuffer_size()
+            vp_x, vp_y, vp_w, vp_h = self._viewport
 
-            if self.intrinsic is None:
-                base_intrinsic = np.array(
-                    [
-                        [render_width, 0.0, render_width * 0.5],
-                        [0.0, render_height, render_height * 0.5],
-                        [0.0, 0.0, 1.0],
-                    ],
-                    dtype=np.float32,
-                )
-            else:
-                base_intrinsic = scale_intrinsic(
-                    self.intrinsic.squeeze(),
-                    self.model_size,
-                    (render_width, render_height),
-                )
+            # Preserve vertical FOV: compute intrinsic scaled by render height
+            base_intrinsic = self._compute_intrinsic_preserve_vertical(
+                self.intrinsic.squeeze() if self.intrinsic is not None else None,
+                self.model_size,
+                (render_width, render_height),
+            )
 
             proj = projection_from_intrinsic(
-                base_intrinsic, render_width, render_height, near, far
+                base_intrinsic if base_intrinsic is not None else None, render_width, render_height, near, far
             )
-            fov_y = 2.0 * math.atan(0.5 * render_height / base_intrinsic[1, 1])
+            # compute vertical fov using fy
+            if base_intrinsic is None:
+                fov_y = 2.0 * math.atan(0.5 * render_height / max(1.0, render_height))
+            else:
+                fov_y = 2.0 * math.atan(0.5 * render_height / base_intrinsic[1, 1])
 
             yaw_rad = math.radians(self.yaw)
             pitch_rad = math.radians(self.pitch)
@@ -777,8 +849,9 @@ def main() -> None:
                         print(f"[viewer] rendered frame shape={getattr(frame, 'shape', None)}; cannot compute stats")
                     # Flip vertically for correct orientation when blitting
                     frame_flip = np.ascontiguousarray(np.flipud(frame))
-                    img = pyglet.image.ImageData(render_width, render_height, 'RGB', frame_flip.tobytes(), pitch=render_width * 3)
-                    img.blit(0, 0)
+                    img = pyglet.image.ImageData(vp_w, vp_h, 'RGB', frame_flip.tobytes(), pitch=vp_w * 3)
+                    # Blit into the computed viewport origin to keep letterboxing/pillarboxing
+                    img.blit(vp_x, vp_y)
                 except Exception as e:
                     print(f"[viewer] frame blit failed: {e}")
 
@@ -909,6 +982,7 @@ def main() -> None:
         args.sigma,
         args.occlusion_threshold,
         args.coarse_level,
+        resizable=True,
     )
     pyglet.app.run()
 
