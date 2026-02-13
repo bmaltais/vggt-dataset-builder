@@ -287,6 +287,7 @@ uv run python aitoolkit.py --prompt "refer to image 2, fix the distortion and bl
 ### System
 
 - `--device <device>`: Force device selection - `cuda` or `cpu` (default: auto-detects CUDA availability)
+- `--force`: Force recalculation and overwrite existing output files (disabled by default).
 
 ## Input Structure
 

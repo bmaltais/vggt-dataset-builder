@@ -190,6 +190,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate bidirectional pairs (A->B and B->A) for each consecutive frame pair (default: off).",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force recalculation and overwrite existing output files.",
+    )
     return parser.parse_args()
 
 
@@ -832,11 +837,15 @@ def check_scene_needs_processing(
     save_confidence: bool,
     save_ply: bool,
     image_paths: list[Path],
+    force: bool = False,
 ) -> bool:
     """Check if this scene needs any processing.
 
     Returns True if any pair is missing files, False if all pairs complete.
     """
+    if force:
+        return True
+
     if len(image_paths) < 2:
         return False
 
@@ -937,7 +946,8 @@ def render_and_save_pair(
     ply_path = paths["ply"]
 
     missing = (
-        not splats_path.exists()
+        args.force
+        or not splats_path.exists()
         or not target_path.exists()
         or not reference_path.exists()
         or (args.save_confidence and not conf_path.exists())
@@ -1061,6 +1071,7 @@ def process_scene(
         args.save_confidence,
         args.save_ply,
         image_paths,
+        force=args.force,
     )
 
     if not scene_needs_work:
