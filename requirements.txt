@@ -29,6 +29,9 @@ glcontext
 pillow-heif
 pyglet
 
+# Windows clipboard support for copying image pixels
+pywin32
+
 # Testing
 pytest>=7.0
 pytest-cov>=4.0

@@ -258,6 +258,19 @@ uv pip install pyglet moderngl glcontext
 ```
 - `--quiet`: Suppress progress output
 
+### Interactive viewer — Controls & Features
+
+- **Right-click menu (pyglet custom UI)**: right-click in the viewer opens a small context menu with actions like "Copy image to clipboard" and "Save image (E)". The menu is drawn with an opaque background and highlights items under the pointer (supports hover while dragging).
+- **Copy to clipboard**: press `Ctrl+C` (or `Cmd+C` on macOS) to render the current frame and copy the pixel image to the system clipboard. On Windows this uses `pywin32` to place a DIB-format image on the clipboard.
+- **Save current frame**: press `E` to export the currently rendered frame to the `--output` path you supplied.
+- **On-screen confirmation**: copy/save operations display a short on-screen toast message (bottom-center) confirming success or showing an error.
+- **Camera reset**: press `F` to reset the camera to the initial view (including clearing any roll). If you prefer restoring the exact initial camera pose captured at startup, that can be enabled.
+- **Input capture while menu visible**: when the context menu is open it captures input — left-click activates the highlighted menu item, right-click dismisses the menu.
+
+Notes:
+- On Windows you must have `pywin32` installed for clipboard image copy to work; `pywin32` has been added to `requirements.txt`.
+- The viewer implements these features using `pyglet` primitives (labels, shapes, and batches). If you prefer native OS context menus instead of a drawn menu, that can be implemented separately per-platform.
+
 ## Command-Line Options
 
 ### Input/Output

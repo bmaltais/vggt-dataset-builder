@@ -9,6 +9,8 @@ import torch.nn.functional as torch_nn
 from PIL import Image
 import sys
 from pathlib import Path as _Path
+import io
+import platform
 
 # Ensure local `vggt/` package is importable when running the script directly
 _repo_root = _Path(__file__).resolve().parent
@@ -21,6 +23,12 @@ from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+try:
+    import win32clipboard
+    import win32con
+except Exception:
+    win32clipboard = None
+    win32con = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -449,6 +457,29 @@ def projection_from_intrinsic(
     return proj
 
 
+def _pil_image_to_clipboard(img: Image.Image) -> None:
+    """Copy a PIL Image to the Windows clipboard as a DIB (works on Windows).
+
+    Raises RuntimeError if not running on Windows or pywin32 not available.
+    """
+    if platform.system() != "Windows":
+        raise RuntimeError("Clipboard image copy only implemented on Windows")
+    if win32clipboard is None or win32con is None:
+        raise RuntimeError("pywin32 is required for clipboard support (install pywin32)")
+
+    output = io.BytesIO()
+    # Save as BMP to get a DIB-compatible byte stream, then strip the 14-byte BMP header
+    img.convert("RGB").save(output, "BMP")
+    data = output.getvalue()[14:]
+
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32con.CF_DIB, data)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
 def build_view_matrix(extrinsic: np.ndarray) -> np.ndarray:
     view = np.eye(4, dtype=np.float32)
     view[:3, :3] = extrinsic[:3, :3]
@@ -649,6 +680,23 @@ def main() -> None:
             self._update_viewport_and_projection(fb_w, fb_h)
             pyglet.clock.schedule_interval(self._update_camera, 1.0 / 60.0)
 
+            # Context menu state for right-click actions
+            self.context_menu_visible = False
+            self.context_menu_origin = (0, 0)
+            self.context_menu_hover_index = -1
+            self.context_menu_item_height = 22
+            self.context_menu_padding = 8
+            self.context_menu_items = [
+                ("Copy image to clipboard", self._copy_current_frame_to_clipboard),
+                ("Save image (E)", self._save_current_frame),
+            ]
+            # cached menu box (ox, oy, w, h)
+            self.context_menu_box = None
+            # message toast
+            self._message_text = ""
+            self._message_duration = 1.5
+            self._message_label = None
+
         def _save_current_frame(self):
             self._ensure_renderer()
             self._render_frame()
@@ -659,6 +707,117 @@ def main() -> None:
             Image.fromarray(frame).save(self.output_path)
             print(f"Saved render to {self.output_path}")
 
+        def _copy_current_frame_to_clipboard(self):
+            self._ensure_renderer()
+            self._render_frame()
+            if self.renderer is None:
+                print("Renderer not initialized; cannot copy to clipboard")
+                return
+            frame = self.renderer.read_final_color()
+            try:
+                img = Image.fromarray(frame)
+                _pil_image_to_clipboard(img)
+                print("Copied render to clipboard")
+                try:
+                    self._show_message("Copied render to clipboard", duration=1.6)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Failed to copy to clipboard: {e}")
+                try:
+                    self._show_message(f"Copy failed: {e}", duration=2.5)
+                except Exception:
+                    pass
+
+        def _update_context_hover(self, x: int, y: int) -> None:
+            # Compute menu box and hover index, clamp to framebuffer
+            ox, oy = self.context_menu_origin
+            items = getattr(self, "context_menu_items", [])
+            item_h = getattr(self, "context_menu_item_height", 22)
+            pad = getattr(self, "context_menu_padding", 8)
+
+            # compute width using text metrics
+            maxw = 0
+            for txt, _ in items:
+                lbl = pyglet.text.Label(txt)
+                w = getattr(lbl, "content_width", len(txt) * 8)
+                maxw = max(maxw, w)
+            box_w = maxw + pad * 2
+            box_h = item_h * len(items)
+
+            fb_w, fb_h = self.get_framebuffer_size()
+            # clamp origin so menu fits in framebuffer
+            ox = min(max(0, ox), max(0, fb_w - 4))
+            oy = min(max(0, oy), max(0, fb_h))
+            if ox + box_w > fb_w:
+                ox = max(0, fb_w - box_w)
+            if oy - box_h < 0:
+                oy = box_h
+            self.context_menu_origin = (int(ox), int(oy))
+            self.context_menu_box = (int(ox), int(oy), int(box_w), int(box_h))
+
+            left = ox
+            right = ox + box_w
+            top = oy
+            bottom = oy - box_h
+
+            if x < left or x > right or y < bottom or y > top:
+                self.context_menu_hover_index = -1
+                return
+            idx = int((top - y) // item_h)
+            if idx < 0 or idx >= len(items):
+                self.context_menu_hover_index = -1
+            else:
+                self.context_menu_hover_index = idx
+
+        def _show_message(self, text: str, duration: float = 1.5) -> None:
+            try:
+                pyglet.clock.unschedule(self._clear_message)
+            except Exception:
+                pass
+            self._message_text = str(text)
+            self._message_duration = float(duration)
+            # create centered label near bottom
+            try:
+                self._message_label = pyglet.text.Label(
+                    self._message_text,
+                    x=self.get_framebuffer_size()[0] // 2,
+                    y=20,
+                    anchor_x="center",
+                    anchor_y="bottom",
+                    color=(255, 255, 255, 255),
+                    font_size=12,
+                )
+            except Exception:
+                self._message_label = None
+            try:
+                pyglet.clock.schedule_once(self._clear_message, self._message_duration)
+            except Exception:
+                pass
+
+        def _clear_message(self, dt: float) -> None:
+            self._message_text = ""
+            try:
+                self._message_label = None
+            except Exception:
+                pass
+
+        def _draw_message(self) -> None:
+            try:
+                if getattr(self, "_message_label", None) is not None:
+                    self._message_label.draw()
+            except Exception:
+                pass
+
+        def on_mouse_motion(self, x, y, dx, dy):
+            # Update hover index for context menu when visible
+            if not getattr(self, "context_menu_visible", False):
+                return
+            try:
+                self._update_context_hover(x, y)
+            except Exception:
+                pass
+
         def _reset_camera(self):
             if self.use_vggt_pose and self.extrinsic is not None:
                 self._init_camera_from_extrinsic(self.extrinsic)
@@ -668,6 +827,17 @@ def main() -> None:
                 self.camera_pos = self.center + np.array(
                     [0.0, 0.0, -self.distance], dtype=np.float32
                 )
+            # Reset roll state so 'F' restores the original upright view
+            try:
+                self.roll = 0.0
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "roll_state") and isinstance(self.roll_state, dict):
+                    self.roll_state["left"] = False
+                    self.roll_state["right"] = False
+            except Exception:
+                pass
 
         def _init_camera_from_extrinsic(self, extrinsic):
             if extrinsic is None:
@@ -879,8 +1049,22 @@ def main() -> None:
             self.clear()
             self._ensure_renderer()
             self._render_frame()
+            # Draw context menu overlay if visible
+            try:
+                if getattr(self, "context_menu_visible", False):
+                    self._draw_context_menu()
+            except Exception:
+                pass
 
         def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
+            # If context menu visible, update hover on drag and consume input
+            if getattr(self, "context_menu_visible", False):
+                try:
+                    self._update_context_hover(x, y)
+                except Exception:
+                    pass
+                return
+
             # If shift-dragging with left button, map drag to strafing/up-down movement
             if getattr(self, "shift_drag", False):
                 # small deadzone to avoid jitter
@@ -914,6 +1098,25 @@ def main() -> None:
                 self.pitch = max(min(self.pitch, 89.0), -89.0)
 
         def on_mouse_press(self, x, y, button, modifiers):
+            # If a context menu is visible, intercept clicks for menu interaction
+            if getattr(self, "context_menu_visible", False):
+                if button == pyglet.window.mouse.LEFT:
+                    idx = getattr(self, "context_menu_hover_index", -1)
+                    if idx is None:
+                        idx = -1
+                    items = getattr(self, "context_menu_items", [])
+                    if idx >= 0 and idx < len(items):
+                        try:
+                            items[idx][1]()
+                        except Exception as e:
+                            print(f"Context menu item failed: {e}")
+                    self.context_menu_visible = False
+                    return
+                elif button == pyglet.window.mouse.RIGHT:
+                    # right click while menu open dismisses it
+                    self.context_menu_visible = False
+                    return
+
             if button == pyglet.window.mouse.LEFT:
                 # If Shift is held while pressing left, enter shift-drag mode (strafe/vertical)
                 try:
@@ -937,6 +1140,17 @@ def main() -> None:
                     self.move_state["up"] = False
                     self.move_state["down"] = False
                 self.mouse_look = False
+            elif button == pyglet.window.mouse.RIGHT:
+                # Open context menu on right-button release (platform-consistent)
+                # If menu already visible this was handled in on_mouse_press above
+                try:
+                    self.context_menu_origin = (int(x), int(y))
+                    # compute hover and clamp box
+                    self.context_menu_visible = True
+                    self.context_menu_hover_index = -1
+                    self._update_context_hover(x, y)
+                except Exception:
+                    self.context_menu_visible = False
 
         def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
             # keep existing behavior (adjust move speed)
@@ -963,11 +1177,16 @@ def main() -> None:
 
         def on_key_press(self, symbol, modifiers):
             if symbol == pyglet.window.key.F:
-                self.yaw = 0.0
-                self.pitch = 0.0
-                self.camera_pos = self.center + np.array(
-                    [0.0, 0.0, -self.distance], dtype=np.float32
-                )
+                # Reset camera to the configured initial pose
+                try:
+                    self._reset_camera()
+                except Exception:
+                    # Fallback to sensible default
+                    self.yaw = 0.0
+                    self.pitch = 0.0
+                    self.camera_pos = self.center + np.array(
+                        [0.0, 0.0, -self.distance], dtype=np.float32
+                    )
             elif symbol == pyglet.window.key.E:
                 self._save_current_frame()
             elif symbol == pyglet.window.key.W:
@@ -984,10 +1203,30 @@ def main() -> None:
                 self.move_state["up"] = True
             elif symbol == pyglet.window.key.LSHIFT:
                 self.move_state["boost"] = True
-            elif symbol == pyglet.window.key.Z:
+
+            # Ctrl+C (or Cmd+C on macOS) -> copy current render to clipboard
+            try:
+                is_copy = (
+                    symbol == pyglet.window.key.C
+                    and (
+                        (modifiers & pyglet.window.key.MOD_CTRL) != 0
+                        or (modifiers & getattr(pyglet.window.key, "MOD_COMMAND", 0)) != 0
+                    )
+                )
+            except Exception:
+                is_copy = False
+            if is_copy:
+                try:
+                    self._copy_current_frame_to_clipboard()
+                except Exception as e:
+                    print(f"Copy to clipboard failed: {e}")
+                # Consume the key so the plain 'C' behavior (roll right) does not run
+                return
+
+            if symbol == pyglet.window.key.Z:
                 # roll left
                 self.roll_state["left"] = True
-            elif symbol == pyglet.window.key.C:
+            if symbol == pyglet.window.key.C:
                 # roll right
                 self.roll_state["right"] = True
 
@@ -1055,6 +1294,76 @@ def main() -> None:
             if norm > 1e-6:
                 velocity = velocity / norm
                 self.camera_pos += velocity * speed * dt
+
+        def _draw_context_menu(self) -> None:
+            # Simple pyglet-drawn context menu at the stored origin (top-left)
+            if not getattr(self, "context_menu_visible", False):
+                return
+            ox, oy = self.context_menu_origin
+            items = getattr(self, "context_menu_items", [])
+            item_h = getattr(self, "context_menu_item_height", 22)
+            pad = getattr(self, "context_menu_padding", 8)
+            # compute widths using labels
+            maxw = 0
+            labels_info = []
+            for idx, (txt, _) in enumerate(items):
+                lbl = pyglet.text.Label(txt, anchor_x="left", anchor_y="top", font_size=12)
+                w = getattr(lbl, "content_width", len(txt) * 8)
+                maxw = max(maxw, w)
+                labels_info.append((txt, w))
+
+            box_w = maxw + pad * 2
+            box_h = item_h * len(items)
+
+            # clamp origin to framebuffer
+            fb_w, fb_h = self.get_framebuffer_size()
+            ox = min(max(0, ox), max(0, fb_w - 4))
+            oy = min(max(0, oy), max(0, fb_h))
+            if ox + box_w > fb_w:
+                ox = max(0, fb_w - box_w)
+            if oy - box_h < 0:
+                oy = box_h
+            self.context_menu_origin = (int(ox), int(oy))
+            self.context_menu_box = (int(ox), int(oy), int(box_w), int(box_h))
+
+            batch = pyglet.graphics.Batch()
+            from pyglet import shapes
+
+            # Background (pyglet shapes use bottom-left origin)
+            bg = shapes.Rectangle(ox, oy - box_h, box_w, box_h, color=(40, 40, 40), batch=batch)
+
+            # Hover highlight
+            hover_idx = getattr(self, "context_menu_hover_index", -1)
+            if 0 <= hover_idx < len(items):
+                hy_y = oy - (hover_idx + 1) * item_h
+                hover_rect = shapes.Rectangle(ox, hy_y, box_w, item_h, color=(70, 70, 70), batch=batch)
+
+            # Labels
+            # vertical padding inside each item
+            pad_v = max(2, (item_h - 12) // 2)
+            labels = []
+            for idx, (txt, _) in enumerate(items):
+                lbl = pyglet.text.Label(
+                    txt,
+                    x=ox + pad,
+                    y=oy - pad_v - idx * item_h,
+                    anchor_x="left",
+                    anchor_y="top",
+                    color=(255, 255, 255, 255),
+                    batch=batch,
+                    font_size=12,
+                )
+                labels.append(lbl)
+
+            try:
+                batch.draw()
+            except Exception:
+                # fallback to drawing labels individually
+                for lbl in labels:
+                    try:
+                        lbl.draw()
+                    except Exception:
+                        pass
 
     print("Controls: left-drag look, scroll adjust speed")
     print("Keys: WASD move, Q/Space down/up, Shift boost, F front view, E export")
