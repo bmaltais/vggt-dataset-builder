@@ -614,6 +614,10 @@ def main() -> None:
             self.camera_pos = self.center + np.array(
                 [0.0, 0.0, self.distance], dtype=np.float32
             )
+            # roll angle (degrees) and roll state
+            self.roll = 0.0
+            self.roll_speed = 45.0
+            self.roll_state = {"left": False, "right": False}
             self.mouse_look = False
             self.move_speed = max(radius * 0.5, 0.05)
             self.look_sensitivity = 0.15
@@ -692,6 +696,18 @@ def main() -> None:
 
         def _init_gl(self):
             gl.glClearColor(0.05, 0.06, 0.07, 1.0)
+
+        def _rotate_vector_around_axis(self, v: np.ndarray, k: np.ndarray, angle_rad: float) -> np.ndarray:
+            # Rodrigues' rotation formula: rotate vector v around axis k (unit) by angle
+            k = np.asarray(k, dtype=np.float32)
+            v = np.asarray(v, dtype=np.float32)
+            k_norm = np.linalg.norm(k)
+            if k_norm < 1e-9:
+                return v
+            k = k / k_norm
+            c = math.cos(angle_rad)
+            s = math.sin(angle_rad)
+            return (v * c) + (np.cross(k, v) * s) + (k * (np.dot(k, v) * (1.0 - c)))
 
         def _compute_intrinsic_preserve_vertical(self, intrinsic: np.ndarray, src_size: tuple[int, int], dst_size: tuple[int, int]) -> np.ndarray:
             # Keep vertical FOV stable: scale by dst_h / src_h for fx and fy,
@@ -820,10 +836,14 @@ def main() -> None:
                 ],
                 dtype=np.float32,
             )
+            # compute up vector with roll applied around the forward axis
+            up = self.world_up
+            if abs(self.roll) > 1e-6:
+                up = self._rotate_vector_around_axis(up, forward, math.radians(self.roll))
             view = look_at(
                 self.camera_pos,
                 self.camera_pos + forward,
-                self.world_up,
+                up,
             )
 
             if self.renderer is None:
@@ -861,6 +881,33 @@ def main() -> None:
             self._render_frame()
 
         def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
+            # If shift-dragging with left button, map drag to strafing/up-down movement
+            if getattr(self, "shift_drag", False):
+                # small deadzone to avoid jitter
+                dead = 2.0
+                if dx < -dead:
+                    self.move_state["left"] = True
+                    self.move_state["right"] = False
+                elif dx > dead:
+                    self.move_state["right"] = True
+                    self.move_state["left"] = False
+                else:
+                    self.move_state["left"] = False
+                    self.move_state["right"] = False
+
+                if dy > dead:
+                    # moving mouse up -> move up (Space)
+                    self.move_state["up"] = True
+                    self.move_state["down"] = False
+                elif dy < -dead:
+                    # moving mouse down -> move down (Q)
+                    self.move_state["down"] = True
+                    self.move_state["up"] = False
+                else:
+                    self.move_state["up"] = False
+                    self.move_state["down"] = False
+                return
+
             if self.mouse_look:
                 self.yaw += dx * self.look_sensitivity
                 self.pitch += dy * self.look_sensitivity
@@ -868,14 +915,51 @@ def main() -> None:
 
         def on_mouse_press(self, x, y, button, modifiers):
             if button == pyglet.window.mouse.LEFT:
-                self.mouse_look = True
+                # If Shift is held while pressing left, enter shift-drag mode (strafe/vertical)
+                try:
+                    shift_held = (modifiers & pyglet.window.key.MOD_SHIFT) != 0
+                except Exception:
+                    shift_held = False
+                if shift_held:
+                    self.shift_drag = True
+                    self.mouse_look = False
+                else:
+                    self.mouse_look = True
 
         def on_mouse_release(self, x, y, button, modifiers):
             if button == pyglet.window.mouse.LEFT:
+                # Clear either mouse look or shift-drag state
+                if getattr(self, "shift_drag", False):
+                    self.shift_drag = False
+                    # clear movement keys set by shift-drag
+                    self.move_state["left"] = False
+                    self.move_state["right"] = False
+                    self.move_state["up"] = False
+                    self.move_state["down"] = False
                 self.mouse_look = False
 
         def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
+            # keep existing behavior (adjust move speed)
             self.move_speed *= math.pow(1.1, scroll_y)
+            # Map scroll wheel to forward/backward motion like W/S.
+            # For a natural feel, set the move state briefly and clear it after a short duration.
+            try:
+                if scroll_y > 0:
+                    self.move_state["forward"] = True
+                    pyglet.clock.schedule_once(lambda dt: self._clear_move_state("forward"), 0.12 * float(scroll_y))
+                elif scroll_y < 0:
+                    self.move_state["backward"] = True
+                    pyglet.clock.schedule_once(lambda dt: self._clear_move_state("backward"), 0.12 * float(abs(scroll_y)))
+            except Exception:
+                pass
+
+        def _clear_move_state(self, key: str, dt: float = 0.0) -> None:
+            # Helper used by scheduled callbacks to clear transient move state
+            try:
+                if key in self.move_state:
+                    self.move_state[key] = False
+            except Exception:
+                pass
 
         def on_key_press(self, symbol, modifiers):
             if symbol == pyglet.window.key.F:
@@ -900,6 +984,12 @@ def main() -> None:
                 self.move_state["up"] = True
             elif symbol == pyglet.window.key.LSHIFT:
                 self.move_state["boost"] = True
+            elif symbol == pyglet.window.key.Z:
+                # roll left
+                self.roll_state["left"] = True
+            elif symbol == pyglet.window.key.C:
+                # roll right
+                self.roll_state["right"] = True
 
         def on_key_release(self, symbol, modifiers):
             if symbol == pyglet.window.key.W:
@@ -916,6 +1006,10 @@ def main() -> None:
                 self.move_state["up"] = False
             elif symbol == pyglet.window.key.LSHIFT:
                 self.move_state["boost"] = False
+            elif symbol == pyglet.window.key.Z:
+                self.roll_state["left"] = False
+            elif symbol == pyglet.window.key.C:
+                self.roll_state["right"] = False
 
         def on_close(self):
             self._save_current_frame()
@@ -932,6 +1026,11 @@ def main() -> None:
                 ],
                 dtype=np.float32,
             )
+            # update roll from key state
+            if self.roll_state["left"]:
+                self.roll += self.roll_speed * dt
+            if self.roll_state["right"]:
+                self.roll -= self.roll_speed * dt
             right = np.cross(forward, self.world_up)
             norm_right = np.linalg.norm(right)
             if norm_right > 1e-6:
