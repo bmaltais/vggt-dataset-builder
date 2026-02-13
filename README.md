@@ -20,7 +20,6 @@ Build warping datasets by rendering VGGT depth point clouds into the next view. 
 
 - [Setup](#setup)
 - [Usage](#usage)
-- [ComfyUI Node (VGGT Model Inference)](#comfyui-node-vggt-model-inference)
 - [ModelScope LoRA Training Dataset](#modelscope-lora-training-dataset)
 - [AI Toolkit Dataset](#ai-toolkit-dataset)
 - [Command-Line Options](#command-line-options)
@@ -88,7 +87,7 @@ This repo includes a ComfyUI node for running VGGT directly and exporting a Gaus
 - `image_2`, `image_3`, `image_4`: Additional frames for multi-image inference (1–4 total). **All images are automatically resized to the same dimensions** before processing to handle different aspect ratios.
 - `depth_conf_threshold` (default: `50.0`): Percentile threshold for confidence filtering (0–100). Example: 50 keeps the top 50% of points.
 - `gaussian_scale_multiplier` (default: `0.1`): Splat size multiplier for the exported Gaussian PLY.
-- `preprocess_mode` (default: `pad_white`):
+- `preprocess_mode` (default: `crop`):
   - `crop`: Demo-style resize to width=518 and center-crop height if needed (can lose top/bottom on tall images).
   - `pad_white`: Preserve all pixels; pad to square with white borders (demo-style padding).
   - `pad_black`: Preserve all pixels; pad to square with black borders.
@@ -287,7 +286,9 @@ uv run python aitoolkit.py --prompt "refer to image 2, fix the distortion and bl
 ### System
 
 - `--device <device>`: Force device selection - `cuda` or `cpu` (default: auto-detects CUDA availability)
-- `--force`: Force recalculation and overwrite existing output files (disabled by default).
+- `--nocache`: Disable reading/writing the on-disk per-frame cache for this run (cached `.npz` files live under `.cache/`).
+- `--clear-cache`: Delete the repository `.cache/` directory before running (useful to drop all precomputed frame data).
+- `--force_output`: Force recalculation and overwrite existing output files (does not by itself delete the on-disk cache).
 
 ## Input Structure
 
@@ -363,3 +364,49 @@ This avoids upscaling artifacts while ensuring consistent output resolution per 
 ### Explicit Dimensions
 
 If `--resize-width` and `--resize-height` are specified, they are capped to honor `--max-megapixels`. For example, with `--max-megapixels 2.0` and `--resize-width 2000 --resize-height 1500` (3.0MP), the dimensions will be scaled down proportionally to ~1633×1225 (2.0MP).
+
+## ComfyUI Node (VGGT Model Inference)
+
+This repository includes a ComfyUI node implementation (`VGGT Model Inference`) that runs the VGGT model and exports a GaussianViewer-compatible PLY plus camera matrices. The node is implemented in `vggt_comfy_nodes.py` and mirrors the demo processing pipeline used elsewhere in the project.
+
+**Node name:** `VGGT Model Inference`
+
+**Inputs (required)**
+
+- `device`: `cuda` or `cpu` (default: `cuda`)
+
+**Inputs (optional)**
+
+- `image_1`..`image_20`: Zero or more connected image inputs. The node will accept up to 20 image inputs and will process all connected images as a sequence. `image_1` is commonly used as the primary frame.
+- `depth_conf_threshold` (default: `50.0`): Percentile threshold (0–100) for confidence filtering; e.g. `50.0` keeps the top 50% of points.
+- `gaussian_scale_multiplier` (default: `0.1`): Multiplier for Gaussian splat size written to the exported PLY.
+- `preprocess_mode` (default: `crop`): How each image is preprocessed prior to inference. Options:
+  - `crop`: Resize to fit within 518px then center-crop height when necessary (matches demo behavior).
+  - `pad_white`: Resize preserving aspect ratio; pad to square with white borders.
+  - `pad_black`: Resize preserving aspect ratio; pad to square with black borders.
+  - `tile`: Keep width = 518px and allow full height (experimental for tall images).
+- `mask_black_bg` (default: `false`): Remove nearly-black background pixels.
+- `mask_white_bg` (default: `false`): Remove nearly-white background pixels.
+- `mask_sky` (default: `false`): Use semantic sky segmentation to filter sky points (requires `opencv-python` and `onnxruntime`).
+- `boundary_threshold` (default: `0`): Exclude points within N pixels of image edges.
+- `max_depth` (default: `-1.0`): Maximum depth distance to keep; `-1.0` disables this filter.
+- `upsample_depth` (default: `true`): Upsample VGGT depth and confidence maps to each image's original resolution prior to unprojection. When enabled and all input images share the same original resolution, depth/conf maps are bicubically upsampled and intrinsics adjusted accordingly.
+
+**Outputs**
+
+- `ply_path` (STRING): Path to the exported PLY file (GaussianViewer-compatible).
+- `extrinsics` (EXTRINSICS): First camera's extrinsic matrix (3×4).
+- `intrinsics` (INTRINSICS): First camera's intrinsic matrix (3×3).
+
+**Behavioral notes**
+
+- Multi-image processing: each connected image is preprocessed independently, then the first processed image's dimensions are used as the target size — subsequent images are resized to match before concatenation. This avoids tensor size mismatch errors when supplying mixed-aspect images.
+- Tiling (`preprocess_mode=tile`) is experimental: the node will keep width=518 and allow larger heights, using an internal tile flag to indicate special handling for very tall images.
+- When `upsample_depth` is enabled, intrinsics are scaled to match the upsampled resolution so unprojection yields correctly scaled world points.
+- Sky filtering downloads a small ONNX model on first use and requires `opencv-python` and `onnxruntime`.
+
+**Example (basic)**
+
+Use the node with `preprocess_mode=crop` and default filtering to generate a PLY and camera matrices for downstream nodes.
+
+---

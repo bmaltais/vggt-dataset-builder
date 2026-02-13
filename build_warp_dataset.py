@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as torch_nn
 from PIL import Image
 import pillow_heif
+import hashlib
 
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
@@ -44,6 +45,9 @@ SUPPORTED_EXTENSIONS = {
     ".heif",
 }
 
+# Local cache directory (per-repo)
+CACHE_DIR = Path(__file__).resolve().parent / ".cache"
+MODEL_ID = "facebook/VGGT-1B"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -191,9 +195,19 @@ def parse_args() -> argparse.Namespace:
         help="Generate bidirectional pairs (A->B and B->A) for each consecutive frame pair (default: off).",
     )
     parser.add_argument(
-        "--force",
+        "--force_output",
         action="store_true",
-        help="Force recalculation and overwrite existing output files.",
+        help="Force recalculation and overwrite existing output files (affects outputs).",
+    )
+    parser.add_argument(
+        "--nocache",
+        action="store_true",
+        help="Disable on-disk per-frame caching (default: off).",
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear the on-disk cache directory (.cache) before running (default: off).",
     )
     return parser.parse_args()
 
@@ -829,6 +843,93 @@ def get_triplet_paths(
     }
 
 
+def _cache_file_for_image(scene_cache_dir: Path, image_path: Path) -> Path:
+    return scene_cache_dir / f"{image_path.stem}.npz"
+
+
+def _image_signature(path: Path) -> str:
+    """Compute a robust signature for an image file.
+
+    This uses a SHA1 of the file contents for strong invalidation. On error,
+    return an empty string so the cache will be treated as invalid.
+    """
+    try:
+        h = hashlib.sha1()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _make_args_hash(args: argparse.Namespace, resize_size: tuple[int, int] | None) -> str:
+    key = {
+        "preprocess_mode": args.preprocess_mode,
+        "max_megapixels": float(args.max_megapixels),
+        "filter_sky": bool(args.filter_sky),
+        "filter_black_bg": bool(args.filter_black_bg),
+        "filter_white_bg": bool(args.filter_white_bg),
+        "upsample_depth": bool(args.upsample_depth),
+        "resize_size": list(resize_size) if resize_size is not None else None,
+        "save_confidence": bool(args.save_confidence),
+        "auto_s0": bool(args.auto_s0),
+        "sigma": float(args.sigma),
+        "depth_conf_threshold": float(args.depth_conf_threshold),
+        "model_id": MODEL_ID,
+    }
+    payload = json.dumps(key, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def save_frame_cache(cache_path: Path, frame_data: dict) -> None:
+    """Save a single frame's point-cloud data to a compressed .npz file.
+
+    Stored arrays: points, colors, confidences. Optional: s0 (float), conf_image (uint8 array).
+    """
+    save_kwargs = {}
+    arrs = {
+        "points": frame_data["points"],
+        "colors": frame_data["colors"],
+        "confidences": frame_data["confidences"],
+    }
+    s0 = frame_data.get("s0")
+    if s0 is not None:
+        arrs["s0"] = np.array(float(s0))
+    conf_image = frame_data.get("conf_image")
+    if conf_image is not None:
+        arrs["conf_image"] = np.array(conf_image, dtype=np.uint8)
+
+    # Ensure parent dir exists
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, **arrs)
+
+
+def load_frame_cache(cache_path: Path) -> dict | None:
+    """Load cached frame data from .npz if available.
+
+    Returns a frame_data dict compatible with in-memory format or None on error.
+    """
+    try:
+        data = np.load(cache_path, allow_pickle=False)
+    except Exception:
+        return None
+
+    try:
+        frame_data = {
+            "points": data["points"],
+            "colors": data["colors"],
+            "confidences": data["confidences"],
+        }
+        if "s0" in data:
+            frame_data["s0"] = float(data["s0"].tolist())
+        if "conf_image" in data:
+            frame_data["conf_image"] = Image.fromarray(data["conf_image"].astype(np.uint8))
+        return frame_data
+    except Exception:
+        return None
+
+
 def check_scene_needs_processing(
     scene_dir: Path,
     output_dir: Path,
@@ -837,6 +938,8 @@ def check_scene_needs_processing(
     save_confidence: bool,
     save_ply: bool,
     image_paths: list[Path],
+    args: argparse.Namespace,
+    resize_size: tuple[int, int] | None,
     force: bool = False,
 ) -> bool:
     """Check if this scene needs any processing.
@@ -851,6 +954,36 @@ def check_scene_needs_processing(
 
     scene_output_dir = output_dir / scene_dir.name
     scene_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cache setup (per-repo .cache/<scene>)
+    cache_enabled = not args.nocache
+    scene_cache_dir = CACHE_DIR / scene_dir.name
+    manifest_path = scene_cache_dir / "manifest.json"
+    manifest_images: dict = {}
+    manifest_args_hash: str | None = None
+    args_hash = _make_args_hash(args, resize_size)
+    if cache_enabled:
+        # Ensure cache dir exists
+        scene_cache_dir.mkdir(parents=True, exist_ok=True)
+        # Load manifest and validate args_hash; invalidate if mismatch
+        try:
+            if manifest_path.exists():
+                with manifest_path.open("r", encoding="utf-8") as fh:
+                    manifest = json.load(fh)
+                manifest_args_hash = manifest.get("args_hash")
+                manifest_images = manifest.get("images", {}) or {}
+                if manifest_args_hash != args_hash:
+                    # Invalidate cache dir
+                    try:
+                        shutil.rmtree(scene_cache_dir)
+                    except Exception:
+                        pass
+                    scene_cache_dir.mkdir(parents=True, exist_ok=True)
+                    manifest_images = {}
+        except Exception:
+            manifest_images = {}
+
+    
 
     for idx in range(len(image_paths) - 1):
         next_idx = idx + 1
@@ -946,7 +1079,7 @@ def render_and_save_pair(
     ply_path = paths["ply"]
 
     missing = (
-        args.force
+        args.force_output
         or not splats_path.exists()
         or not target_path.exists()
         or not reference_path.exists()
@@ -1071,7 +1204,9 @@ def process_scene(
         args.save_confidence,
         args.save_ply,
         image_paths,
-        force=args.force,
+        args,
+        resize_size,
+        force=args.force_output,
     )
 
     if not scene_needs_work:
@@ -1250,11 +1385,54 @@ def process_scene(
             depth_for_unproject, extrinsic, intrinsic
         )
 
+        # Cache setup (per-repo .cache/<scene>)
+        cache_enabled = not args.nocache
+        scene_cache_dir = CACHE_DIR / scene_dir.name
+        manifest_path = scene_cache_dir / "manifest.json"
+        manifest_images: dict = {}
+        manifest_args_hash: str | None = None
+        args_hash = _make_args_hash(args, resize_size)
+        if cache_enabled:
+            # Ensure cache dir exists
+            scene_cache_dir.mkdir(parents=True, exist_ok=True)
+            # Load manifest and validate args_hash; invalidate if mismatch
+            try:
+                if manifest_path.exists():
+                    with manifest_path.open("r", encoding="utf-8") as fh:
+                        manifest = json.load(fh)
+                    manifest_args_hash = manifest.get("args_hash")
+                    manifest_images = manifest.get("images", {}) or {}
+                    if manifest_args_hash != args_hash:
+                        # Invalidate cache dir
+                        try:
+                            shutil.rmtree(scene_cache_dir)
+                        except Exception:
+                            pass
+                        scene_cache_dir.mkdir(parents=True, exist_ok=True)
+                        manifest_images = {}
+            except Exception:
+                manifest_images = {}
+
         # ⚡ Bolt: Pre-calculate and cache filtered point cloud data once per frame.
         # This avoids redundant expensive extraction and filtering in the rendering loop.
         frame_data_cache = []
         print(f"Pre-calculating point cloud data for {len(image_paths)} frames...")
         for idx in range(len(image_paths)):
+            # Try to load cached frame data first (unless forced/nocache)
+            cache_path = _cache_file_for_image(scene_cache_dir, image_paths[idx])
+            if cache_enabled and not args.force_output and cache_path.exists():
+                # Validate image signature against manifest before loading
+                try:
+                    sig = _image_signature(image_paths[idx])
+                    cached_sig = manifest_images.get(image_paths[idx].stem)
+                    if cached_sig == sig:
+                        cached = load_frame_cache(cache_path)
+                        if cached is not None:
+                            frame_data_cache.append(cached)
+                            continue
+                except Exception:
+                    pass
+
             depth_frame = depth[idx]
             conf_frame = depth_conf[idx]
             if depth_frame.ndim == 3:
@@ -1322,6 +1500,19 @@ def process_scene(
                             resize_size, Image.Resampling.BICUBIC
                         )
                 frame_data["conf_image"] = conf_image
+
+            # Save to cache if enabled, and update manifest
+            if cache_enabled and not args.force_output:
+                try:
+                    save_frame_cache(cache_path, frame_data)
+                    manifest_images[image_paths[idx].stem] = _image_signature(image_paths[idx])
+                    try:
+                        with manifest_path.open("w", encoding="utf-8") as fh:
+                            json.dump({"args_hash": args_hash, "images": manifest_images}, fh)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
             frame_data_cache.append(frame_data)
 
@@ -1451,6 +1642,23 @@ def main() -> None:
                 )
             skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
 
+    # Handle explicit cache clearing request
+    if args.clear_cache:
+        if CACHE_DIR.exists():
+            try:
+                shutil.rmtree(CACHE_DIR)
+                print(f"Cleared cache directory: {CACHE_DIR}")
+            except Exception:
+                print(f"Warning: failed to clear cache directory: {CACHE_DIR}")
+        else:
+            print(f"Cache directory not present: {CACHE_DIR}")
+
+    # Ensure cache dir exists for later operations
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
     for scene_dir in scene_dirs:
         process_scene(
             scene_dir,
@@ -1463,6 +1671,7 @@ def main() -> None:
             output_dir,
             resize_size,
         )
+
 
 
 if __name__ == "__main__":

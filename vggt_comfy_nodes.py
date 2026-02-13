@@ -158,7 +158,7 @@ class VGGT_Model_Inference:
                     "tooltip": "Multiplier for Gaussian splat size (higher = larger splats)"
                 }),
                 "preprocess_mode": (["crop", "pad_white", "pad_black", "tile"], {
-                    "default": "pad_white",
+                    "default": "crop",
                     "tooltip": "Preprocessing mode: crop=demo default (may crop tall images), pad_white=preserve all pixels with white padding (demo-style), pad_black=preserve all pixels with black padding, tile=full height at 518px width (experimental)"
                 }),
                 "mask_black_bg": ("BOOLEAN", {
@@ -245,7 +245,7 @@ class VGGT_Model_Inference:
     CATEGORY = "VGGT"
     OUTPUT_NODE = False  # Not a terminal output node, results are passed to other nodes
 
-    def infer(self, device, image_1=None, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="pad_white", mask_black_bg=False, mask_white_bg=False, mask_sky=False, boundary_threshold=0, max_depth=-1.0, upsample_depth=True, **kwargs):
+    def infer(self, device, image_1=None, depth_conf_threshold=50.0, gaussian_scale_multiplier=0.1, preprocess_mode="crop", mask_black_bg=False, mask_white_bg=False, mask_sky=False, boundary_threshold=0, max_depth=-1.0, upsample_depth=True, **kwargs):
         # Combine multiple images into a sequence
         # Dynamically collect all connected image inputs from image_1 onwards
         images_list = []
