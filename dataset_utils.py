@@ -129,8 +129,8 @@ def validate_image_file(file_path: Path, file_type: str = "image") -> None:
         raise ImportError("PIL (Pillow) is required for image validation")
     
     try:
-        img = Image.open(file_path)
-        # Force load to verify the file is valid
-        img.load()
+        with Image.open(file_path) as img:
+            # Force load to verify the file is valid
+            img.load()
     except Exception as e:
         raise ValueError(f"Cannot read {file_type} image: {file_path} - {e}")
