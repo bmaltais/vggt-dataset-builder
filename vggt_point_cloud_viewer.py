@@ -7,14 +7,12 @@ import numpy as np
 import torch
 import torch.nn.functional as torch_nn
 from PIL import Image
-import sys
 import io
 import platform
 
 from hole_filling_renderer import HoleFillingRenderer
 from dataset_utils import (
     load_model,
-    build_view_matrix,
     select_device,
     select_dtype,
     setup_vggt_path,
@@ -23,7 +21,6 @@ from dataset_utils import (
 # Ensure local vggt/ submodule is importable
 setup_vggt_path()
 
-from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
