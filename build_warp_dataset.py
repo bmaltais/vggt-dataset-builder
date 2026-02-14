@@ -1453,6 +1453,14 @@ def process_scene(
             # only if not in cache.
             depth_frame = depth[idx]
             conf_frame = depth_conf[idx]
+
+            # ⚡ Bolt: Ensure 2D arrays (H, W) for processing to avoid 5D tensor errors
+            # in restore_map_to_original_resolution and shape errors in apply_sky_filter.
+            if depth_frame.ndim == 3:
+                depth_frame = depth_frame.squeeze(-1)
+            if conf_frame.ndim == 3:
+                conf_frame = conf_frame.squeeze(-1)
+
             meta = preprocess_metas[idx]
 
             if args.upsample_depth:
