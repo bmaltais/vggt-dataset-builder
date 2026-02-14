@@ -13,6 +13,7 @@ try:
     from PIL import Image
     HAS_PIL = True
 except ImportError:
+    Image = None
     HAS_PIL = False
 
 
