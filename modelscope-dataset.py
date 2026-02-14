@@ -31,66 +31,17 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+from dataset_utils import (
+    find_triplets_in_scene,
+    get_file_extension,
+    HAS_PIL,
+    validate_image_file,
+)
+
 try:
     from PIL import Image
-    HAS_PIL = True
 except ImportError:
-    HAS_PIL = False
-
-
-def get_file_extension(pattern_path: Optional[Path]) -> str:
-    """Get file extension from a path, or return empty string if None."""
-    if pattern_path is None:
-        return ""
-    return pattern_path.suffix.lower()
-
-
-def find_triplets_in_scene(scene_dir: Path) -> list[dict]:
-    """Find all triplets in a scene directory.
-    
-    Returns a list of dicts, each with keys:
-      - splats: Path to *_splats.<ext> file
-      - reference: Path to *_reference.<ext> file (excluding .ply)
-      - target: Path to *_target.<ext> file
-      - stem: Base name without suffix
-    """
-    triplets = {}
-    
-    for file_path in scene_dir.iterdir():
-        if not file_path.is_file():
-            continue
-        
-        name = file_path.name
-        
-        # Extract the stem (e.g., "image1" from "image1_splats.jpg")
-        # Only match specific suffixes to avoid metadata files like _reference_intrinsics.txt
-        if name.endswith("_splats.jpg") or name.endswith("_splats.png"):
-            stem = name.replace("_splats.jpg", "").replace("_splats.png", "")
-            if stem not in triplets:
-                triplets[stem] = {}
-            triplets[stem]["splats"] = file_path
-            triplets[stem]["stem"] = stem
-        elif (name.endswith("_reference.jpg") or name.endswith("_reference.png")):
-            # Only match JPG and PNG, NOT PLY or TXT files
-            stem = name.replace("_reference.jpg", "").replace("_reference.png", "")
-            if stem not in triplets:
-                triplets[stem] = {}
-            triplets[stem]["reference"] = file_path
-            triplets[stem]["stem"] = stem
-        elif name.endswith("_target.jpg") or name.endswith("_target.png"):
-            stem = name.replace("_target.jpg", "").replace("_target.png", "")
-            if stem not in triplets:
-                triplets[stem] = {}
-            triplets[stem]["target"] = file_path
-            triplets[stem]["stem"] = stem
-    
-    # Filter to only complete triplets and return as list
-    complete_triplets = []
-    for stem, files in sorted(triplets.items()):
-        if "splats" in files and "reference" in files and "target" in files:
-            complete_triplets.append(files)
-    
-    return complete_triplets
+    Image = None
 
 
 def extract_dataset(
@@ -155,12 +106,10 @@ def extract_dataset(
                     (files["target"], "target"),
                 ]:
                     try:
-                        img = Image.open(src_file)
-                        # Force load to verify the file is valid
-                        img.load()
-                    except Exception as e:
+                        validate_image_file(src_file, dest_name)
+                    except ValueError as e:
                         print(f"  ERROR: Invalid image file {src_file.name}: {e}")
-                        raise ValueError(f"Cannot read {dest_name} image: {src_file}")
+                        raise
             
             shutil.copy2(files["splats"], splats_dest)
             shutil.copy2(files["reference"], reference_dest)

@@ -1,46 +1,14 @@
 #!/usr/bin/env python3
 """Test script to verify triplet detection in aitoolkit and modelscope scripts."""
 
+import sys
 from pathlib import Path
 import pytest
 
-def find_triplets_in_scene(scene_dir: Path) -> list[dict]:
-    """Find all triplets in a scene directory."""
-    triplets = {}
-    
-    for file_path in scene_dir.iterdir():
-        if not file_path.is_file():
-            continue
-        
-        name = file_path.name
-        
-        # Extract the stem (e.g., "image1" from "image1_splats.jpg")
-        if "_splats" in name and file_path.suffix.lower() != ".ply":
-            stem = name.split("_splats")[0]
-            if stem not in triplets:
-                triplets[stem] = {}
-            triplets[stem]["splats"] = file_path
-            triplets[stem]["stem"] = stem
-        elif "_reference" in name and file_path.suffix.lower() != ".ply":
-            stem = name.split("_reference")[0]
-            if stem not in triplets:
-                triplets[stem] = {}
-            triplets[stem]["reference"] = file_path
-            triplets[stem]["stem"] = stem
-        elif "_target" in name and file_path.suffix.lower() != ".ply":
-            stem = name.split("_target")[0]
-            if stem not in triplets:
-                triplets[stem] = {}
-            triplets[stem]["target"] = file_path
-            triplets[stem]["stem"] = stem
-    
-    # Filter to only complete triplets and return as list
-    complete_triplets = []
-    for stem, files in sorted(triplets.items()):
-        if "splats" in files and "reference" in files and "target" in files:
-            complete_triplets.append(files)
-    
-    return complete_triplets
+# Add parent directory to path to import dataset_utils
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from dataset_utils import find_triplets_in_scene
 
 def test_triplet_detection(tmp_path):
     """Test the triplet detection logic using a temporary directory."""
