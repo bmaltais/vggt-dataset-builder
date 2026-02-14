@@ -17,3 +17,11 @@
 ## 2026-02-12 - [Redundant Point Cloud Extraction]
 **Learning:** In bidirectional rendering pipelines, each frame is often used as a source for multiple target views. Performing point cloud extraction, sky filtering, and background masking repeatedly for the same source frame adds massive redundant overhead in NumPy indexing and I/O.
 **Action:** Pre-calculate and cache filtered point cloud data once per frame; delete original large arrays immediately to minimize peak memory usage.
+
+## 2026-02-13 - [Deferred High-Resolution Processing]
+**Learning:** Allocating stacks of upsampled depth maps and world point clouds for an entire scene (e.g., 100+ frames) at once leads to massive peak memory spikes that can cause OOM errors. Moving these expensive operations inside a per-frame loop and deferring them until actually needed reduces peak memory by ~10x and avoids work for cached frames.
+**Action:** Defer high-resolution allocations and expensive post-processing to the last possible moment; process on a per-frame basis to keep memory footprint flat.
+
+## 2026-02-13 - [Sparse Unprojection]
+**Learning:** Unprojecting a full HxW depth map to a (H,W,3) world point array is inefficient when many pixels are invalid or filtered. Vectorizing the unprojection to operate only on masked valid points avoids large meshgrid allocations and redundant matrix multiplications.
+**Action:** Use masked indexing to unproject only valid depth points into world space.

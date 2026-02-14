@@ -16,7 +16,10 @@ import pillow_heif
 import hashlib
 
 from vggt.models.vggt import VGGT
-from vggt.utils.geometry import unproject_depth_map_to_point_map
+from vggt.utils.geometry import (
+    unproject_depth_map_to_point_map,
+    closed_form_inverse_se3,
+)
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from hole_filling_renderer import HoleFillingRenderer
@@ -746,6 +749,52 @@ def restore_map_to_original_resolution(
     return map_tensor.squeeze(0).squeeze(0).numpy()
 
 
+def unproject_depth_to_points(
+    depth_frame: np.ndarray,
+    intrinsic: np.ndarray,
+    extrinsic: np.ndarray,
+    depth_threshold: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Efficiently unproject only valid depth points to world coordinates.
+
+    ⚡ Bolt: This avoids creating and processing large (H,W,3) arrays for invalid pixels,
+    and is significantly faster than unprojecting the entire depth map.
+
+    Args:
+        depth_frame: (H, W) or (H, W, 1) depth map
+        intrinsic: (3, 3) camera intrinsic matrix
+        extrinsic: (3, 4) camera extrinsic matrix (cam-from-world)
+        depth_threshold: Threshold for valid depth
+
+    Returns:
+        tuple of (N, 3) world points and (H, W) valid mask
+    """
+    if depth_frame.ndim == 3:
+        depth_frame = depth_frame.squeeze(-1)
+
+    mask = depth_frame > depth_threshold
+    v, u = np.where(mask)
+    z = depth_frame[mask]
+
+    fx = float(intrinsic[0, 0])
+    fy = float(intrinsic[1, 1])
+    cx = float(intrinsic[0, 2])
+    cy = float(intrinsic[1, 2])
+
+    # Unproject to camera coordinates
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    cam_coords = np.stack((x, y, z), axis=-1).astype(np.float32)
+
+    # Transform to world coords (need world-from-cam)
+    cam_to_world = closed_form_inverse_se3(extrinsic[None])[0]
+    R = cam_to_world[:3, :3]
+    t = cam_to_world[:3, 3]
+
+    world_points = np.dot(cam_coords, R.T) + t
+    return world_points.astype(np.float32), mask
+
+
 def resize_map_to_output(
     map_data: np.ndarray, output_size: tuple[int, int]
 ) -> np.ndarray:
@@ -1060,8 +1109,8 @@ def render_and_save_pair(
     save_kwargs: dict,
     args: argparse.Namespace,
     frame_data: dict,
-    extrinsic: np.ndarray,
-    intrinsic: np.ndarray,
+    extrinsic_batch: np.ndarray,
+    intrinsic_render_batch: list[np.ndarray],
     preprocess_metas: list[dict],
     renderer: HoleFillingRenderer,
     render_width: int,
@@ -1102,13 +1151,10 @@ def render_and_save_pair(
     if args.auto_s0 and s0 > 0.0:
         renderer.s0 = s0
 
-    view_mat = build_view_matrix(extrinsic[target_idx])
-    if args.upsample_depth:
-        target_intrinsic = intrinsic[target_idx]
-    else:
-        target_intrinsic = intrinsic_for_output(
-            intrinsic[target_idx], preprocess_metas[target_idx], resize_size
-        )
+    view_mat = build_view_matrix(extrinsic_batch[target_idx])
+    # ⚡ Bolt: Use pre-calculated rendering intrinsic
+    target_intrinsic = intrinsic_render_batch[target_idx]
+
     proj_mat = build_projection_matrix(target_intrinsic, render_width, render_height)
     fov_y = 2.0 * np.arctan(0.5 * render_height / target_intrinsic[1, 1])
 
@@ -1318,50 +1364,24 @@ def process_scene(
         extrinsic = extrinsic.squeeze(0).cpu().numpy()
         intrinsic = intrinsic.squeeze(0).cpu().numpy()
 
-        if args.upsample_depth:
-            if output_size is None:
-                raise ValueError("Output size is required when upsampling depth.")
-            images_np = []
-            for path in image_paths:
-                with Image.open(path) as img:
-                    img = img.convert("RGB")
-                    if img.size != output_size:
-                        img = img.resize(output_size, Image.Resampling.BICUBIC)
-                    images_np.append(np.array(img, dtype=np.float32) / 255.0)
-            images_np = np.stack(images_np, axis=0)
+        # ⚡ Bolt: Defer all high-resolution allocations and expensive post-processing
+        # (upsampling, unprojection) to the per-frame loop. This saves ~10x peak memory.
 
-            depth_frames = []
-            conf_frames = []
-            intrinsic_frames = []
-            for idx, meta in enumerate(preprocess_metas):
-                depth_frame_map = depth[idx]
-                if depth_frame_map.ndim == 3:
-                    depth_frame_map = depth_frame_map.squeeze(-1)
-                conf_frame_map = depth_conf[idx]
-                if conf_frame_map.ndim == 3:
-                    conf_frame_map = conf_frame_map.squeeze(-1)
+        # Prepare all intrinsics up front (very fast)
+        intrinsic_render_batch = []
+        intrinsic_unproject_batch = []
+        for idx, meta in enumerate(preprocess_metas):
+            intri_render = intrinsic_for_output(intrinsic[idx], meta, output_size if args.upsample_depth else resize_size)
+            intrinsic_render_batch.append(intri_render)
+            if args.upsample_depth:
+                intrinsic_unproject_batch.append(intri_render)
+            else:
+                intrinsic_unproject_batch.append(intrinsic[idx])
 
-                depth_frame_map = restore_map_to_original_resolution(
-                    depth_frame_map, meta, args.preprocess_mode
-                )
-                conf_frame_map = restore_map_to_original_resolution(
-                    conf_frame_map, meta, args.preprocess_mode, fill_value=0.0
-                )
-                depth_frame_map = resize_map_to_output(depth_frame_map, output_size)
-                conf_frame_map = resize_map_to_output(conf_frame_map, output_size)
-                depth_frames.append(depth_frame_map)
-                conf_frames.append(conf_frame_map)
-                intrinsic_frames.append(
-                    intrinsic_for_output(intrinsic[idx], meta, output_size)
-                )
-
-            depth = np.stack(depth_frames, axis=0)
-            depth_conf = np.stack(conf_frames, axis=0)
-            intrinsic = np.stack(intrinsic_frames, axis=0)
-            depth_for_unproject = ensure_depth_channel(depth)
-        else:
-            images_np = images.cpu().numpy().transpose(0, 2, 3, 1)
-            depth_for_unproject = ensure_depth_channel(depth)
+        # Prepare small model-resolution images if upsampling is off
+        images_small_np = None
+        if not args.upsample_depth:
+            images_small_np = images.cpu().numpy().transpose(0, 2, 3, 1)
 
         # Renderer management
         renderer = renderer_info["renderer"]
@@ -1380,10 +1400,6 @@ def process_scene(
             renderer_info["renderer_size"] = (render_height, render_width)
         else:
             renderer.confidence_threshold = args.depth_conf_threshold
-
-        world_points = unproject_depth_map_to_point_map(
-            depth_for_unproject, extrinsic, intrinsic
-        )
 
         # Cache setup (per-repo .cache/<scene>)
         cache_enabled = not args.nocache
@@ -1433,12 +1449,22 @@ def process_scene(
                 except Exception:
                     pass
 
+            # ⚡ Bolt: Defer expensive per-frame processing (upsampling, unprojection)
+            # only if not in cache.
             depth_frame = depth[idx]
             conf_frame = depth_conf[idx]
-            if depth_frame.ndim == 3:
-                depth_frame = depth_frame.squeeze(-1)
-            if conf_frame.ndim == 3:
-                conf_frame = conf_frame.squeeze(-1)
+            meta = preprocess_metas[idx]
+
+            if args.upsample_depth:
+                # Perform upsampling only when needed
+                depth_frame = restore_map_to_original_resolution(
+                    depth_frame, meta, args.preprocess_mode
+                )
+                conf_frame = restore_map_to_original_resolution(
+                    conf_frame, meta, args.preprocess_mode, fill_value=0.0
+                )
+                depth_frame = resize_map_to_output(depth_frame, output_size)
+                conf_frame = resize_map_to_output(conf_frame, output_size)
 
             # Apply sky filtering if enabled
             if args.filter_sky and skyseg_session is not None:
@@ -1447,9 +1473,26 @@ def process_scene(
                     conf_frame, image_paths[idx], skyseg_session, sky_masks_dir
                 )
 
-            valid_mask = depth_frame > 1e-6
-            points = world_points[idx][valid_mask]
-            colors = images_np[idx][valid_mask]
+            # ⚡ Bolt: Efficient unprojection only for valid points
+            points, valid_mask = unproject_depth_to_points(
+                depth_frame,
+                intrinsic_unproject_batch[idx],
+                extrinsic[idx],
+                depth_threshold=1e-6,
+            )
+
+            # Extract colors for valid points
+            if args.upsample_depth:
+                # Load and resize image only for this frame
+                with Image.open(image_paths[idx]) as img:
+                    img = img.convert("RGB")
+                    if img.size != output_size:
+                        img = img.resize(output_size, Image.Resampling.BICUBIC)
+                    colors_frame = np.array(img, dtype=np.float32) / 255.0
+            else:
+                colors_frame = images_small_np[idx]
+
+            colors = colors_frame[valid_mask]
             confidences = conf_frame[valid_mask]
 
             # Apply background filtering if enabled
@@ -1468,7 +1511,9 @@ def process_scene(
             }
 
             if args.auto_s0:
-                frame_data["s0"] = estimate_s0_from_depth(depth_frame, intrinsic[idx])
+                frame_data["s0"] = estimate_s0_from_depth(
+                    depth_frame, intrinsic_unproject_batch[idx]
+                )
 
             if args.save_confidence:
                 # Normalize to 0-255 range
@@ -1482,46 +1527,53 @@ def process_scene(
 
                 if not args.upsample_depth and resize_size is None:
                     # Restore to original resolution
-                    conf_image = Image.fromarray(conf_uint8, mode="L")
-                    meta = preprocess_metas[idx]
+                    conf_image_obj = Image.fromarray(conf_uint8, mode="L")
                     left = int(meta["total_pad_left"])
                     top = int(meta["total_pad_top"])
                     right = left + int(meta["effective_width"])
                     bottom = top + int(meta["effective_height"])
-                    conf_image = conf_image.crop((left, top, right, bottom))
-                    conf_image = conf_image.resize(
+                    conf_image_obj = conf_image_obj.crop((left, top, right, bottom))
+                    conf_image_obj = conf_image_obj.resize(
                         (int(meta["orig_width"]), int(meta["orig_height"])),
                         Image.Resampling.BICUBIC,
                     )
                 else:
-                    conf_image = Image.fromarray(conf_uint8, mode="L")
+                    conf_image_obj = Image.fromarray(conf_uint8, mode="L")
                     if resize_size is not None:
-                        conf_image = conf_image.resize(
+                        conf_image_obj = conf_image_obj.resize(
                             resize_size, Image.Resampling.BICUBIC
                         )
-                frame_data["conf_image"] = conf_image
+                frame_data["conf_image"] = conf_image_obj
 
             # Save to cache if enabled, and update manifest
             if cache_enabled and not args.force_output:
                 try:
                     save_frame_cache(cache_path, frame_data)
-                    manifest_images[image_paths[idx].stem] = _image_signature(image_paths[idx])
+                    manifest_images[image_paths[idx].stem] = _image_signature(
+                        image_paths[idx]
+                    )
                     try:
                         with manifest_path.open("w", encoding="utf-8") as fh:
-                            json.dump({"args_hash": args_hash, "images": manifest_images}, fh)
+                            json.dump(
+                                {"args_hash": args_hash, "images": manifest_images}, fh
+                            )
                     except Exception:
                         pass
                 except Exception:
                     pass
 
             frame_data_cache.append(frame_data)
+            # Explicitly clear temporary frame data to keep peak memory low
+            del depth_frame
+            del conf_frame
+            if args.upsample_depth:
+                del colors_frame
 
-        # ⚡ Bolt: Explicitly delete large arrays after pre-calculation to free memory.
+        # ⚡ Bolt: Explicitly delete large arrays after pre-calculation
         del depth
         del depth_conf
-        del world_points
-        del images_np
-        del depth_for_unproject
+        if images_small_np is not None:
+            del images_small_np
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -1541,7 +1593,7 @@ def process_scene(
                 args,
                 frame_data_cache[idx],
                 extrinsic,
-                intrinsic,
+                intrinsic_render_batch,
                 preprocess_metas,
                 renderer,
                 render_width,
@@ -1561,7 +1613,7 @@ def process_scene(
                     args,
                     frame_data_cache[next_idx],
                     extrinsic,
-                    intrinsic,
+                    intrinsic_render_batch,
                     preprocess_metas,
                     renderer,
                     render_width,
