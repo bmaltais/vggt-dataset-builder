@@ -6,7 +6,8 @@ from PIL import Image
 
 from hole_filling_renderer import HoleFillingRenderer
 
-def main():
+def test_viewer_smoke():
+    """Test rendering a synthetic point cloud with HoleFillingRenderer."""
     out = Path("output") / "viewer_smoke.png"
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -35,6 +36,3 @@ def main():
     frame = renderer.render(points, colors, confs, view, proj, fov_y)
     Image.fromarray(frame).save(out)
     print(f"Saved smoke render to {out}")
-
-if __name__ == '__main__':
-    main()
