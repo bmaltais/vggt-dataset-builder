@@ -45,11 +45,6 @@ from dataset_utils import (
     validate_image_file,
 )
 
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
-
 
 def extract_dataset(
     output_dir: Path,
