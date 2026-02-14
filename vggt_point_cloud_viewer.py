@@ -8,12 +8,11 @@ import torch
 import torch.nn.functional as torch_nn
 from PIL import Image
 import sys
-from pathlib import Path as _Path
 import io
 import platform
 
 # Ensure local `vggt/` package is importable when running the script directly
-_repo_root = _Path(__file__).resolve().parent
+_repo_root = Path(__file__).resolve().parent
 _vggt_path = str(_repo_root / "vggt")
 if _vggt_path not in sys.path:
     sys.path.insert(0, _vggt_path)
@@ -650,6 +649,7 @@ def main() -> None:
             self.roll_speed = 45.0
             self.roll_state = {"left": False, "right": False}
             self.mouse_look = False
+            self.shift_drag = False
             self.move_speed = max(radius * 0.5, 0.05)
             self.look_sensitivity = 0.15
             self.use_vggt_pose = True
@@ -1055,6 +1055,8 @@ def main() -> None:
                     self._draw_context_menu()
             except Exception:
                 pass
+            # Draw toast / message overlays if any
+            self._draw_message()
 
         def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
             # If context menu visible, update hover on drag and consume input
@@ -1167,7 +1169,7 @@ def main() -> None:
             except Exception:
                 pass
 
-        def _clear_move_state(self, key: str, dt: float = 0.0) -> None:
+        def _clear_move_state(self, key: str, dt: float) -> None:
             # Helper used by scheduled callbacks to clear transient move state
             try:
                 if key in self.move_state:

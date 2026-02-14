@@ -265,7 +265,7 @@ void main() {
             # Bind default framebuffer (screen) and draw the final texture
             try:
                 self.ctx.screen.use()
-            except Exception:
+            except AttributeError:
                 # fallback: use None
                 pass
             self.ctx.viewport = (0, 0, self.width, self.height)
