@@ -1455,6 +1455,12 @@ def process_scene(
             conf_frame = depth_conf[idx]
             meta = preprocess_metas[idx]
 
+            # Ensure frames are 2D for downstream processing
+            if depth_frame.ndim == 3:
+                depth_frame = depth_frame.squeeze(-1)
+            if conf_frame.ndim == 3:
+                conf_frame = conf_frame.squeeze(-1)
+
             if args.upsample_depth:
                 # Perform upsampling only when needed
                 depth_frame = restore_map_to_original_resolution(
