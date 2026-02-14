@@ -36,4 +36,3 @@ def test_viewer_smoke():
     frame = renderer.render(points, colors, confs, view, proj, fov_y)
     Image.fromarray(frame).save(out)
     print(f"Saved smoke render to {out}")
-
