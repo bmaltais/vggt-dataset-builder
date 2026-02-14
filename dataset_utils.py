@@ -120,8 +120,8 @@ def validate_image_file(file_path: Path, file_type: str = "image") -> None:
         file_type: Descriptive name for the file type (used in error messages).
     
     Raises:
-        ValueError: If PIL is not available or the image cannot be read.
         ImportError: If PIL is not installed.
+        ValueError: If the image cannot be read or is invalid.
     
     Example:
         >>> validate_image_file(Path("image.jpg"), "splats")

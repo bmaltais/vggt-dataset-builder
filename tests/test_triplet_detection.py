@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """Test script to verify triplet detection in aitoolkit and modelscope scripts."""
 
-import sys
 from pathlib import Path
 import pytest
-
-# Add parent directory to path to import dataset_utils
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dataset_utils import find_triplets_in_scene
 
