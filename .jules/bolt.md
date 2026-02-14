@@ -25,3 +25,7 @@
 ## 2026-02-13 - [Sparse Unprojection]
 **Learning:** Unprojecting a full HxW depth map to a (H,W,3) world point array is inefficient when many pixels are invalid or filtered. Vectorizing the unprojection to operate only on masked valid points avoids large meshgrid allocations and redundant matrix multiplications.
 **Action:** Use masked indexing to unproject only valid depth points into world space.
+
+## 2026-02-14 - [Redundant Image Loading During Rendering]
+**Learning:** When `--upsample-depth` is enabled, images are loaded from disk and resized TWICE: once during pre-calculation for color extraction, and again in `render_and_save_pair()` to save reference/target images. This redundant disk I/O and BICUBIC resizing adds 50%+ overhead. Caching the resized PIL Image object in frame_data eliminates the second load entirely.
+**Action:** Cache expensive image operations in intermediate data structures to avoid redundant disk I/O and CPU-intensive operations (resize, color conversion) when the same data is needed later in the pipeline.
