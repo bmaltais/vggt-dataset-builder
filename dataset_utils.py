@@ -134,4 +134,4 @@ def validate_image_file(file_path: Path, file_type: str = "image") -> None:
             # Force load to verify the file is valid
             img.load()
     except Exception as e:
-        raise ValueError(f"Cannot read {file_type} image: {file_path} - {e}")
+        raise ValueError(f"Cannot read {file_type} image: {file_path} - {e}") from e
