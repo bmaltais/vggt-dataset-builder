@@ -29,3 +29,7 @@
 ## 2026-02-14 - [Redundant Image Loading During Rendering]
 **Learning:** When `--upsample-depth` is enabled, images are loaded from disk and resized TWICE: once during pre-calculation for color extraction, and again in `render_and_save_pair()` to save reference/target images. This redundant disk I/O and BICUBIC resizing adds 50%+ overhead. Caching the resized PIL Image object in frame_data eliminates the second load entirely.
 **Action:** Cache expensive image operations in intermediate data structures to avoid redundant disk I/O and CPU-intensive operations (resize, color conversion) when the same data is needed later in the pipeline.
+
+## 2026-02-15 - [Multi-Pass Interpolation & Correct Caching]
+**Learning:** Combining multiple spatial transformations (e.g., restore from crop + resize to output) into a single interpolation pass significantly reduces CPU overhead and resampling artifacts. Additionally, caching PIL Image objects across the bidirectional pipeline avoids massive redundant disk I/O and BICUBIC resizing, while fixing a critical bug where source frame data was incorrectly used for target frame outputs.
+**Action:** Always look for sequential interpolations that can be merged; ensure caching logic correctly distinguishes between source and target frame metadata in rendering pipelines.

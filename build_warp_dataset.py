@@ -722,6 +722,7 @@ def restore_map_to_original_resolution(
     mode: str,
     *,
     fill_value: float = 0.0,
+    target_size: tuple[int, int] | None = None,
 ) -> np.ndarray:
     map_tensor = torch.from_numpy(model_map).unsqueeze(0).unsqueeze(0)
     left = int(meta["total_pad_left"])
@@ -744,9 +745,15 @@ def restore_map_to_original_resolution(
         canvas[:, :, crop_top : crop_top + cropped_height, :cropped_width] = map_tensor
         map_tensor = canvas
 
+    # ⚡ Bolt: Use target_size if provided to avoid redundant second interpolation
+    interp_size = (
+        (target_size[1], target_size[0])
+        if target_size
+        else (int(meta["orig_height"]), int(meta["orig_width"]))
+    )
     map_tensor = torch_nn.interpolate(
         map_tensor,
-        size=(int(meta["orig_height"]), int(meta["orig_width"])),
+        size=interp_size,
         mode="bilinear",
         align_corners=False,
     )
@@ -1106,7 +1113,8 @@ def render_and_save_pair(
     output_ext: str,
     save_kwargs: dict,
     args: argparse.Namespace,
-    frame_data: dict,
+    source_frame_data: dict,
+    target_frame_data: dict,
     extrinsic_batch: np.ndarray,
     intrinsic_render_batch: list[np.ndarray],
     preprocess_metas: list[dict],
@@ -1141,10 +1149,10 @@ def render_and_save_pair(
         return
 
     # ⚡ Bolt: Use pre-calculated frame data to avoid redundant filtering and extraction
-    points = frame_data["points"]
-    colors = frame_data["colors"]
-    confidences = frame_data["confidences"]
-    s0 = frame_data.get("s0", 0.0)
+    points = source_frame_data["points"]
+    colors = source_frame_data["colors"]
+    confidences = source_frame_data["confidences"]
+    s0 = source_frame_data.get("s0", 0.0)
 
     if args.auto_s0 and s0 > 0.0:
         renderer.s0 = s0
@@ -1170,8 +1178,8 @@ def render_and_save_pair(
         Image.fromarray(splats_image).save(splats_path, **save_kwargs)
 
     if args.save_confidence and not conf_path.exists():
-        # ⚡ Bolt: Use pre-calculated confidence image
-        conf_image = frame_data.get("conf_image")
+        # ⚡ Bolt: Use pre-calculated confidence image from target frame
+        conf_image = target_frame_data.get("conf_image")
         if conf_image is not None:
             # Always save confidence as PNG for lossless grayscale
             conf_image.save(conf_path)
@@ -1179,7 +1187,8 @@ def render_and_save_pair(
     if not target_path.exists() or not reference_path.exists():
         # ⚡ Bolt: Reuse cached images from frame_data when available to avoid
         # redundant disk I/O and resize operations (up to 50% faster with --upsample-depth).
-        target_img_obj = frame_data.get("img_cached")
+        # We use target_frame_data for target image and source_frame_data for reference image.
+        target_img_obj = target_frame_data.get("img_cached")
         should_close_target = True
 
         if target_img_obj is None:
@@ -1192,12 +1201,18 @@ def render_and_save_pair(
         else:
             should_close_target = False
 
-        reference_img_obj = Image.open(image_paths[source_idx])
-        reference_img_obj = reference_img_obj.convert("RGB")
-        if resize_size is not None:
-            reference_img_obj = reference_img_obj.resize(
-                resize_size, Image.Resampling.BICUBIC
-            )
+        reference_img_obj = source_frame_data.get("img_cached")
+        should_close_reference = True
+
+        if reference_img_obj is None:
+            reference_img_obj = Image.open(image_paths[source_idx])
+            reference_img_obj = reference_img_obj.convert("RGB")
+            if resize_size is not None:
+                reference_img_obj = reference_img_obj.resize(
+                    resize_size, Image.Resampling.BICUBIC
+                )
+        else:
+            should_close_reference = False
 
         try:
             if not target_path.exists():
@@ -1207,7 +1222,7 @@ def render_and_save_pair(
         finally:
             if should_close_target and target_img_obj is not None:
                 target_img_obj.close()
-            if reference_img_obj is not None:
+            if should_close_reference and reference_img_obj is not None:
                 reference_img_obj.close()
 
     # Save PLY file if requested
@@ -1479,15 +1494,18 @@ def process_scene(
             meta = preprocess_metas[idx]
 
             if args.upsample_depth:
-                # Perform upsampling only when needed
+                # ⚡ Bolt: Perform upsampling directly to output resolution
+                # to avoid redundant interpolation passes.
                 depth_frame = restore_map_to_original_resolution(
-                    depth_frame, meta, args.preprocess_mode
+                    depth_frame, meta, args.preprocess_mode, target_size=output_size
                 )
                 conf_frame = restore_map_to_original_resolution(
-                    conf_frame, meta, args.preprocess_mode, fill_value=0.0
+                    conf_frame,
+                    meta,
+                    args.preprocess_mode,
+                    fill_value=0.0,
+                    target_size=output_size,
                 )
-                depth_frame = resize_map_to_output(depth_frame, output_size)
-                conf_frame = resize_map_to_output(conf_frame, output_size)
 
             # Apply sky filtering if enabled
             if args.filter_sky and skyseg_session is not None:
@@ -1513,14 +1531,16 @@ def process_scene(
                     img = img.convert("RGB")
                     if img.size != output_size:
                         img = img.resize(output_size, Image.Resampling.BICUBIC)
-                    colors_frame = np.array(img, dtype=np.float32) / 255.0
                     # Cache the resized PIL image for later use in render_and_save_pair
                     img_cached = img.copy()
+                    # ⚡ Bolt: Extract colors sparsely from uint8 array to save memory
+                    # and avoid redundant float32 conversions for the entire image.
+                    img_np = np.array(img)  # uint8 (H, W, 3)
+                    colors = img_np[valid_mask].astype(np.float32) / 255.0
             else:
                 colors_frame = images_small_np[idx]
+                colors = colors_frame[valid_mask]
                 img_cached = None
-
-            colors = colors_frame[valid_mask]
             confidences = conf_frame[valid_mask]
 
             # Apply background filtering if enabled
@@ -1624,6 +1644,7 @@ def process_scene(
                 save_kwargs,
                 args,
                 frame_data_cache[idx],
+                frame_data_cache[next_idx],
                 extrinsic,
                 intrinsic_render_batch,
                 preprocess_metas,
@@ -1644,6 +1665,7 @@ def process_scene(
                     save_kwargs,
                     args,
                     frame_data_cache[next_idx],
+                    frame_data_cache[idx],
                     extrinsic,
                     intrinsic_render_batch,
                     preprocess_metas,
