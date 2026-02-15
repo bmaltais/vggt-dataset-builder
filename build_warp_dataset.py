@@ -724,22 +724,6 @@ def restore_map_to_original_resolution(
     fill_value: float = 0.0,
     target_size: tuple[int, int] | None = None,
 ) -> np.ndarray:
-    """
-    Restore a depth or confidence map to its original resolution.
-
-    Args:
-        model_map: The depth or confidence map from the model (e.g., ZoeDepth output).
-        meta: Metadata dictionary containing padding, cropping, and sizing information.
-        mode: Restoration mode - either "crop" or "pad".
-        fill_value: Value to use for padding areas (default: 0.0).
-        target_size: Optional target size as (width, height) tuple. If provided,
-                     interpolates directly to this size instead of the original resolution.
-                     NOTE: Expects (width, height) convention, which will be converted
-                     internally to (height, width) for torch.nn.functional.interpolate.
-
-    Returns:
-        Restored map as a 2D numpy array.
-    """
     map_tensor = torch.from_numpy(model_map).unsqueeze(0).unsqueeze(0)
     left = int(meta["total_pad_left"])
     top = int(meta["total_pad_top"])
@@ -1673,8 +1657,7 @@ def process_scene(
             # Explicitly clear temporary frame data to keep peak memory low
             del depth_frame
             del conf_frame
-            # Only delete colors_frame if it was actually created (when NOT upsampling)
-            if not args.upsample_depth:
+            if args.upsample_depth:
                 del colors_frame
 
         # ⚡ Bolt: Explicitly delete large arrays after pre-calculation
