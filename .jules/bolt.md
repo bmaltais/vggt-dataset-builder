@@ -33,3 +33,7 @@
 ## 2026-02-15 - [Multi-Pass Interpolation & Correct Caching]
 **Learning:** Combining multiple spatial transformations (e.g., restore from crop + resize to output) into a single interpolation pass significantly reduces CPU overhead and resampling artifacts. Additionally, caching PIL Image objects across the bidirectional pipeline avoids massive redundant disk I/O and BICUBIC resizing, while fixing a critical bug where source frame data was incorrectly used for target frame outputs.
 **Action:** Always look for sequential interpolations that can be merged; ensure caching logic correctly distinguishes between source and target frame metadata in rendering pipelines.
+
+## 2026-02-15 - [Lazy Pre-calculation & Active Memory Management]
+**Learning:** In pipelines with dependency chains (like bidirectional rendering), pre-calculating all intermediate states upfront is wasteful if many outputs already exist. Additionally, storing PIL Image objects for the entire scene can lead to OOM; clearing them from the cache immediately after their last use in the loop keeps memory usage constant.
+**Action:** Use "needed frames" sets to skip redundant pre-calculation; actively clear large objects from caches during iterative processing once their dependency lifecycle ends.
