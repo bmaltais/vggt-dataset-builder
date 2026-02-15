@@ -70,32 +70,65 @@ app.registerExtension({
                 overlay.style.top = "10px";
                 overlay.style.left = "10px";
                 overlay.style.color = "white";
-                overlay.style.background = "rgba(0,0,0,0.5)";
-                overlay.style.padding = "5px";
-                overlay.style.borderRadius = "4px";
+                overlay.style.background = "rgba(0,0,0,0.6)";
+                overlay.style.padding = "8px";
+                overlay.style.borderRadius = "6px";
                 overlay.style.fontSize = "12px";
                 overlay.style.pointerEvents = "none";
                 overlay.style.zIndex = "10";
+                overlay.style.boxShadow = "0 2px 4px rgba(0,0,0,0.3)";
                 container.appendChild(overlay);
 
+                const selectId = "vggt-camera-select-" + Math.random().toString(36).substr(2, 9);
                 const cameraSelect = document.createElement("select");
+                cameraSelect.id = selectId;
+                cameraSelect.setAttribute("aria-label", "Select camera to snap view");
                 cameraSelect.style.pointerEvents = "auto";
                 cameraSelect.style.marginTop = "5px";
                 cameraSelect.style.display = "none";
-                overlay.appendChild(document.createElement("div")).textContent = "Cameras:";
+                cameraSelect.style.backgroundColor = "#222";
+                cameraSelect.style.color = "white";
+                cameraSelect.style.border = "1px solid #444";
+                cameraSelect.style.borderRadius = "4px";
+                cameraSelect.style.padding = "2px";
+
+                const cameraLabel = document.createElement("label");
+                cameraLabel.textContent = "Snap to Camera:";
+                cameraLabel.htmlFor = selectId;
+                cameraLabel.style.display = "block";
+                cameraLabel.style.fontWeight = "bold";
+                cameraLabel.style.marginBottom = "2px";
+                overlay.appendChild(cameraLabel);
                 overlay.appendChild(cameraSelect);
 
-                this.viewerInitPromise = this.initViewer(container, cameraStateWidget, cameraSelect);
+                const loadingIndicator = document.createElement("div");
+                loadingIndicator.textContent = "Loading Point Cloud...";
+                loadingIndicator.style.position = "absolute";
+                loadingIndicator.style.top = "50%";
+                loadingIndicator.style.left = "50%";
+                loadingIndicator.style.transform = "translate(-50%, -50%)";
+                loadingIndicator.style.color = "white";
+                loadingIndicator.style.backgroundColor = "rgba(0,0,0,0.7)";
+                loadingIndicator.style.padding = "10px 20px";
+                loadingIndicator.style.borderRadius = "20px";
+                loadingIndicator.style.display = "none";
+                loadingIndicator.style.zIndex = "20";
+                loadingIndicator.style.pointerEvents = "none";
+                container.appendChild(loadingIndicator);
+
+                this.viewerInitPromise = this.initViewer(container, cameraStateWidget, cameraSelect, loadingIndicator);
 
 				return r;
 			};
 
-            nodeType.prototype.initViewer = async function(container, cameraStateWidget, cameraSelect) {
+            nodeType.prototype.initViewer = async function(container, cameraStateWidget, cameraSelect, loadingIndicator) {
                 await ensureThree();
                 const THREE = window.THREE;
 
                 const renderer = new THREE.WebGLRenderer({ antialias: true });
                 renderer.setPixelRatio(window.devicePixelRatio);
+                renderer.domElement.setAttribute("role", "img");
+                renderer.domElement.setAttribute("aria-label", "3D Point Cloud Viewer");
                 container.appendChild(renderer.domElement);
 
                 const scene = new THREE.Scene();
@@ -167,8 +200,10 @@ app.registerExtension({
                 animate();
 
                 this.loadPLY = (url) => {
+                    if (loadingIndicator) loadingIndicator.style.display = "block";
                     const loader = new THREE.PLYLoader();
                     loader.load(url, (geometry) => {
+                        if (loadingIndicator) loadingIndicator.style.display = "none";
                         // Dispose previous content
                         pointsGroup.traverse((obj) => {
                             if (obj.geometry) obj.geometry.dispose();
@@ -203,6 +238,15 @@ app.registerExtension({
                         camera.far = radius * 1000;
                         camera.updateProjectionMatrix();
                         controls.update();
+                    }, undefined, (error) => {
+                        console.error("VGGT.Viewer: Error loading PLY", error);
+                        if (loadingIndicator) {
+                            loadingIndicator.textContent = "Error loading PLY";
+                            setTimeout(() => {
+                                loadingIndicator.style.display = "none";
+                                loadingIndicator.textContent = "Loading Point Cloud...";
+                            }, 3000);
+                        }
                     });
                 };
 
