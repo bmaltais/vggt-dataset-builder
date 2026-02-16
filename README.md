@@ -327,6 +327,7 @@ Notes:
 - `--auto-s0`: Automatically estimate per-frame Gaussian splat size (s0) from depth and intrinsics (disabled by default)
 - `--save-confidence`: Save depth confidence maps as PNG files (disabled by default)
 - `--save-ply`: Save point clouds as PLY files for reference frames (disabled by default). Creates viewable 3D point clouds with RGB colors and optional confidence values.
+- `--save-vis`: Save a side-by-side visualization of the reference image, rendered splats, and target image for each pair (disabled by default). Useful for quick quality inspection.
 
 ### Point Cloud Filtering
 
@@ -378,6 +379,7 @@ output/
     image2_splats.jpg      # Rendered from previous view (image1→image2)
     image2_target.jpg      # Ground truth current view
     image2_reference.jpg   # Previous view (reference)
+    image2_vis.jpg         # Side-by-side comparison (if --save-vis)
     image2_confidence.png  # Depth confidence map (if --save-confidence)
     image2_reference.ply   # Point cloud (if --save-ply)
 ```

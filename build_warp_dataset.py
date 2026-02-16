@@ -208,6 +208,11 @@ def parse_args() -> argparse.Namespace:
         help="Generate bidirectional pairs (A->B and B->A) for each consecutive frame pair (default: off).",
     )
     parser.add_argument(
+        "--save-vis",
+        action="store_true",
+        help="Save a side-by-side visualization of reference, splats, and target (default: off).",
+    )
+    parser.add_argument(
         "--force_output",
         action="store_true",
         help="Force recalculation and overwrite existing output files (affects outputs).",
@@ -892,6 +897,7 @@ def get_triplet_paths(
         "reference": scene_output_dir / f"{stem}_reference.{output_ext}",
         "confidence": scene_output_dir / f"{stem}_confidence.png",
         "ply": scene_output_dir / f"{stem}_reference.ply",
+        "vis": scene_output_dir / f"{stem}_vis.jpg",
     }
 
 
@@ -1054,6 +1060,7 @@ def check_scene_needs_processing(
                     and paths["reference"].exists()
                     and (not save_confidence or paths["confidence"].exists())
                     and (not save_ply or paths["ply"].exists())
+                    and (not args.save_vis or paths["vis"].exists())
                 )
                 if files_ok:
                     return True
@@ -1132,6 +1139,7 @@ def render_and_save_pair(
     reference_path = paths["reference"]
     conf_path = paths["confidence"]
     ply_path = paths["ply"]
+    vis_path = paths["vis"]
 
     missing = (
         args.force_output
@@ -1140,6 +1148,7 @@ def render_and_save_pair(
         or not reference_path.exists()
         or (args.save_confidence and not conf_path.exists())
         or (args.save_ply and not ply_path.exists())
+        or (args.save_vis and not vis_path.exists())
     )
 
     if not missing:
@@ -1249,6 +1258,50 @@ def render_and_save_pair(
         f"Wrote {scene_output_dir.name}/{splats_path.name}, {target_path.name}, "
         f"and {reference_path.name}{ply_note}"
     )
+
+    # Save side-by-side visualization if requested
+    if args.save_vis and (args.force_output or not vis_path.exists()):
+        # Load Reference
+        ref_img = source_frame_data.get("img_cached")
+        ref_opened = False
+        if ref_img is None:
+            ref_img = Image.open(image_paths[source_idx]).convert("RGB")
+            if (args.upsample_depth or resize_size is not None) and ref_img.size != (
+                render_width,
+                render_height,
+            ):
+                ref_img = ref_img.resize((render_width, render_height), Image.Resampling.BICUBIC)
+            ref_opened = True
+
+        # Load Target
+        tar_img = target_frame_data.get("img_cached")
+        tar_opened = False
+        if tar_img is None:
+            tar_img = Image.open(image_paths[target_idx]).convert("RGB")
+            if (args.upsample_depth or resize_size is not None) and tar_img.size != (
+                render_width,
+                render_height,
+            ):
+                tar_img = tar_img.resize((render_width, render_height), Image.Resampling.BICUBIC)
+            tar_opened = True
+
+        # Splat is already available as splats_image (numpy)
+        splat_img = Image.fromarray(splats_image)
+
+        # Combine: Reference | Splat | Target
+        w, h = splat_img.size
+        combined = Image.new("RGB", (w * 3, h))
+        combined.paste(ref_img, (0, 0))
+        combined.paste(splat_img, (w, 0))
+        combined.paste(tar_img, (w * 2, 0))
+
+        combined.save(vis_path, quality=90, optimize=True)
+        print(f"Wrote {scene_output_dir.name}/{vis_path.name}")
+
+        if ref_opened:
+            ref_img.close()
+        if tar_opened:
+            tar_img.close()
 
 
 def process_scene(
