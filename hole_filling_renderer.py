@@ -679,7 +679,8 @@ void main() {
 
     def _read_final_color(self) -> np.ndarray:
         # ⚡ Bolt: Fast GPU-to-CPU readback by using a 3-channel uint8 texture.
-        # Alpha premultiplication and color scaling are handled in the fragment shader.
+        # Alpha premultiplication happens in the fragment shader; normalized floats (0–1)
+        # are then implicitly converted to 0–255 uint8 by the RGB8 render target/readback.
         texture = self.final_mask_pass.color_textures[0]
         data = texture.read()
         rgb = np.frombuffer(data, dtype=np.uint8).reshape(
