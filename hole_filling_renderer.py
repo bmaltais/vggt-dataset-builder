@@ -158,7 +158,7 @@ void main() {
         self.push_color_passes = self._init_push_passes()
         self.pull_color_passes = self._init_pull_passes()
         self.final_mask_pass = self._init_single_pass(
-            self.width, self.height, [(3, "u1")]
+            self.width, self.height, [(4, "f4")]
         )
         self.jfa_init_pass = self._init_jfa_seed_pass()
         self.jfa_step_passes = [self._init_jfa_seed_pass(), self._init_jfa_seed_pass()]
@@ -678,16 +678,17 @@ void main() {
         quad.render(mode=moderngl.TRIANGLE_STRIP)
 
     def _read_final_color(self) -> np.ndarray:
-        # ⚡ Bolt: Fast GPU-to-CPU readback by using a 3-channel uint8 texture.
-        # Alpha premultiplication happens in the fragment shader; normalized floats (0–1)
-        # are then implicitly converted to 0–255 uint8 by the RGB8 render target/readback.
         texture = self.final_mask_pass.color_textures[0]
         data = texture.read()
-        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
-            (texture.height, texture.width, 3)
+        rgba = np.frombuffer(data, dtype=np.float32).reshape(
+            (texture.height, texture.width, 4)
         )
-        # Flip vertically as OpenGL coordinates start from bottom-left
-        return np.ascontiguousarray(np.flipud(rgb))
+        rgba = np.flipud(rgba)
+        rgba = np.clip(rgba, 0.0, 1.0)
+        # Keep alpha: the pipeline relies on premultiplication; dropping alpha (e.g., RGB8)
+        # can wash out splats and produce mostly-white outputs.
+        rgb = rgba[..., :3] * rgba[..., 3:4]
+        return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
 
     def read_final_color(self) -> np.ndarray:
         """Public wrapper that returns the final rendered RGB image as uint8.
