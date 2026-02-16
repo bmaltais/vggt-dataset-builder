@@ -37,3 +37,7 @@
 ## 2026-02-15 - [Lazy Pre-calculation & Active Memory Management]
 **Learning:** In pipelines with dependency chains (like bidirectional rendering), pre-calculating all intermediate states upfront is wasteful if many outputs already exist. Additionally, storing PIL Image objects for the entire scene can lead to OOM; clearing them from the cache immediately after their last use in the loop keeps memory usage constant.
 **Action:** Use "needed frames" sets to skip redundant pre-calculation; actively clear large objects from caches during iterative processing once their dependency lifecycle ends.
+
+## 2025-05-15 - [Headless GPU Rendering]
+**Learning:** Running ModernGL-based rendering or tests in headless Linux environments will fail with `Exception: (standalone) XOpenDisplay: cannot open display`. Using `xvfb-run` provides the necessary virtual X server for the OpenGL context to initialize correctly.
+**Action:** Always wrap Python commands that use `HoleFillingRenderer` in `xvfb-run` when working in a remote or CI environment.
