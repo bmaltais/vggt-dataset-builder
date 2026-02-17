@@ -16,11 +16,10 @@ even when ComfyUI is not available (for direct script usage).
 """
 
 import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-import sys
-from pathlib import Path
 
 from dataset_utils import setup_vggt_path
 
