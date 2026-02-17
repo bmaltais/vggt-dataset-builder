@@ -7,6 +7,7 @@ from pathlib import Path
 
 from dataset_utils import (
     FrameCacheManager,
+    PointCloudFilter,
     load_model,
     build_view_matrix,
     select_device,
@@ -288,76 +289,6 @@ def write_ply(
             vertex_data["confidence"] = confidences.ravel()
 
         f.write(vertex_data.tobytes())
-
-
-def apply_sky_filter(
-    conf_frame: np.ndarray,
-    image_path: Path,
-    skyseg_session,
-    sky_masks_dir: Path,
-) -> np.ndarray:
-    """Apply sky segmentation to filter confidence scores."""
-    if not SKY_FILTER_AVAILABLE:
-        print(
-            "Warning: Sky filtering requires opencv-python and onnxruntime. Skipping."
-        )
-        return conf_frame
-
-    sky_masks_dir.mkdir(parents=True, exist_ok=True)
-    image_name = image_path.name
-    mask_path = sky_masks_dir / image_name
-
-    if mask_path.exists():
-        sky_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-    else:
-        sky_mask = segment_sky(str(image_path), skyseg_session, str(mask_path))
-
-    # Resize mask to match confidence map if needed
-    H, W = conf_frame.shape
-    if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
-        sky_mask = cv2.resize(sky_mask, (W, H))
-
-    # Apply mask (segment_sky returns 255 for non-sky, 0 for sky)
-    sky_mask_binary = (sky_mask > 128).astype(np.float32)
-    return conf_frame * sky_mask_binary
-
-
-def apply_background_filters(
-    colors: np.ndarray,
-    filter_black: bool,
-    filter_white: bool,
-) -> np.ndarray:
-    """Apply black and/or white background filtering.
-
-    Args:
-        colors: Nx3 array of RGB colors (0-1 range)
-        filter_black: Filter black background
-        filter_white: Filter white background
-
-    Returns:
-        Boolean mask of valid points
-    """
-    mask = np.ones(colors.shape[0], dtype=bool)
-    if not (filter_black or filter_white):
-        return mask
-
-    # ⚡ Bolt: Use float comparisons directly to avoid expensive uint8 conversions
-    # and redundant computations for black/white filtering.
-    if filter_black:
-        # RGB sum < 16/255 approx 0.0627 in 0-1 float range
-        mask &= colors.sum(axis=1) >= (16 / 255.0)
-
-    if filter_white:
-        # ⚡ Bolt: floor(c * 255) > 240  <=>  c * 255 >= 241  <=>  c >= 241/255
-        # This avoids creating an expensive floor copy and multiple mask arrays.
-        threshold = 241.0 / 255.0
-        mask &= ~(
-            (colors[:, 0] >= threshold)
-            & (colors[:, 1] >= threshold)
-            & (colors[:, 2] >= threshold)
-        )
-
-    return mask
 
 
 def sorted_image_paths(input_dir: Path, skip_every: int) -> list[Path]:
@@ -1191,6 +1122,15 @@ def process_scene(
     scene_output_dir = output_dir / scene_dir.name
     scene_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize point cloud filter with configuration
+    point_cloud_filter = PointCloudFilter(
+        filter_sky=args.filter_sky,
+        filter_black_bg=args.filter_black_bg,
+        filter_white_bg=args.filter_white_bg,
+        sky_masks_dir=scene_output_dir / "sky_masks" if args.filter_sky else None,
+        skyseg_session=skyseg_session,
+    )
+
     # Check upfront if this scene needs any processing (before rescaling to save time)
     scene_needs_work = check_scene_needs_processing(
         scene_dir,
@@ -1428,10 +1368,9 @@ def process_scene(
                 )
 
             # Apply sky filtering if enabled
-            if args.filter_sky and skyseg_session is not None:
-                sky_masks_dir = scene_output_dir / "sky_masks"
-                conf_frame = apply_sky_filter(
-                    conf_frame, image_paths[idx], skyseg_session, sky_masks_dir
+            if point_cloud_filter.has_confidence_filters():
+                conf_frame = point_cloud_filter.apply_confidence_filter(
+                    conf_frame, image_paths[idx]
                 )
 
             # ⚡ Bolt: Efficient unprojection only for valid points
@@ -1464,10 +1403,8 @@ def process_scene(
             confidences = conf_frame[valid_mask]
 
             # Apply background filtering if enabled
-            if args.filter_black_bg or args.filter_white_bg:
-                bg_mask = apply_background_filters(
-                    colors, args.filter_black_bg, args.filter_white_bg
-                )
+            if point_cloud_filter.has_color_filters():
+                bg_mask = point_cloud_filter.apply_color_filter(colors)
                 points = points[bg_mask]
                 colors = colors[bg_mask]
                 confidences = confidences[bg_mask]

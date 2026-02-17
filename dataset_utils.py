@@ -254,6 +254,181 @@ class FrameCacheManager:
         self.manifest = {}
 
 
+class PointCloudFilter:
+    """Manages point cloud filtering operations for depth-based reconstruction.
+
+    This class encapsulates multiple filtering strategies to clean up point clouds
+    generated from depth maps. Filtering can occur at two stages:
+    1. Pre-unprojection: Applying masks to confidence maps (e.g., sky segmentation)
+    2. Post-unprojection: Filtering 3D points based on color (e.g., background removal)
+
+    The class manages both the filtering configuration and runtime state (sky
+    segmentation session, mask caching directory), eliminating the need for
+    scattered procedural functions and external state management.
+
+    Attributes:
+        filter_sky: Enable sky segmentation filtering.
+        filter_black_bg: Filter black background points (RGB sum < 16).
+        filter_white_bg: Filter white background points (RGB > 240 per channel).
+        sky_masks_dir: Directory for caching sky segmentation masks.
+        skyseg_session: ONNX session for sky segmentation model (optional).
+
+    Example:
+        >>> filter_cfg = PointCloudFilter(
+        ...     filter_sky=True,
+        ...     filter_black_bg=True,
+        ...     sky_masks_dir=Path("output/scene/sky_masks"),
+        ...     skyseg_session=onnx_session
+        ... )
+        >>> # Apply sky filter to confidence map
+        >>> conf_filtered = filter_cfg.apply_confidence_filter(conf_map, image_path)
+        >>> # Later, filter colors after unprojection
+        >>> color_mask = filter_cfg.apply_color_filter(point_colors)
+    """
+
+    def __init__(
+        self,
+        filter_sky: bool = False,
+        filter_black_bg: bool = False,
+        filter_white_bg: bool = False,
+        sky_masks_dir: Optional[Path] = None,
+        skyseg_session=None,
+    ) -> None:
+        """Initialize the point cloud filter with configuration and resources.
+
+        Args:
+            filter_sky: If True, use sky segmentation to filter sky pixels.
+            filter_black_bg: If True, filter black background points (RGB sum < 16).
+            filter_white_bg: If True, filter white background points (RGB > 240).
+            sky_masks_dir: Directory to cache sky segmentation masks (required if filter_sky=True).
+            skyseg_session: ONNX runtime session for sky segmentation (required if filter_sky=True).
+
+        Returns:
+            None
+        """
+        self.filter_sky = bool(filter_sky)
+        self.filter_black_bg = bool(filter_black_bg)
+        self.filter_white_bg = bool(filter_white_bg)
+        self.sky_masks_dir = sky_masks_dir
+        self.skyseg_session = skyseg_session
+
+        # Validate configuration
+        if self.filter_sky and self.sky_masks_dir is not None:
+            self.sky_masks_dir.mkdir(parents=True, exist_ok=True)
+
+    def has_confidence_filters(self) -> bool:
+        """Check if any confidence-stage filters are enabled.
+
+        Returns:
+            True if sky filtering is enabled, False otherwise.
+        """
+        return self.filter_sky
+
+    def has_color_filters(self) -> bool:
+        """Check if any color-stage filters are enabled.
+
+        Returns:
+            True if black or white background filtering is enabled.
+        """
+        return self.filter_black_bg or self.filter_white_bg
+
+    def apply_confidence_filter(
+        self, conf_frame: "np.ndarray", image_path: Path
+    ) -> "np.ndarray":
+        """Apply filtering to confidence map (pre-unprojection stage).
+
+        Currently applies sky segmentation if enabled. The confidence map is
+        multiplied by a binary mask where 0 = sky (filtered) and 1 = valid.
+
+        Args:
+            conf_frame: 2D confidence map (H x W), float32.
+            image_path: Path to the source image (used for loading/caching sky masks).
+
+        Returns:
+            Filtered confidence map with same shape as input. Sky pixels
+            will have confidence set to 0.
+
+        Raises:
+            ImportError: If sky filtering is enabled but opencv or onnxruntime unavailable.
+        """
+        if not self.filter_sky:
+            return conf_frame
+
+        if not HAS_NUMPY:
+            raise ImportError("numpy is required for confidence filtering")
+
+        # Import cv2 and segment_sky on-demand to avoid hard dependency
+        try:
+            import cv2
+            from vggt.visual_util import segment_sky
+        except ImportError as exc:
+            print(
+                "Warning: Sky filtering requires opencv-python and onnxruntime. Skipping."
+            )
+            return conf_frame
+
+        if self.skyseg_session is None or self.sky_masks_dir is None:
+            print("Warning: Sky filtering enabled but session/directory missing.")
+            return conf_frame
+
+        # Load or generate sky mask
+        image_name = image_path.name
+        mask_path = self.sky_masks_dir / image_name
+
+        if mask_path.exists():
+            sky_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        else:
+            sky_mask = segment_sky(str(image_path), self.skyseg_session, str(mask_path))
+
+        # Resize mask to match confidence map if needed
+        H, W = conf_frame.shape
+        if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
+            sky_mask = cv2.resize(sky_mask, (W, H))
+
+        # Apply mask (segment_sky returns 255 for non-sky, 0 for sky)
+        sky_mask_binary = (sky_mask > 128).astype(np.float32)
+        return conf_frame * sky_mask_binary
+
+    def apply_color_filter(self, colors: "np.ndarray") -> "np.ndarray":
+        """Apply filtering to point colors (post-unprojection stage).
+
+        Filters black and/or white background points based on RGB values.
+        This is applied after points are unprojected to 3D space.
+
+        Args:
+            colors: Nx3 array of RGB colors in [0, 1] range (float32).
+
+        Returns:
+            Boolean mask of shape (N,) where True = keep point, False = filter.
+            All True if no color filters are enabled.
+
+        Raises:
+            ImportError: If numpy is not available.
+        """
+        if not HAS_NUMPY:
+            raise ImportError("numpy is required for color filtering")
+
+        mask = np.ones(colors.shape[0], dtype=bool)
+
+        if not (self.filter_black_bg or self.filter_white_bg):
+            return mask
+
+        # Filter black background: RGB sum < 16/255 approx 0.0627 in 0-1 float range
+        if self.filter_black_bg:
+            mask &= colors.sum(axis=1) >= (16 / 255.0)
+
+        # Filter white background: All channels >= 241/255
+        if self.filter_white_bg:
+            threshold = 241.0 / 255.0
+            mask &= ~(
+                (colors[:, 0] >= threshold)
+                & (colors[:, 1] >= threshold)
+                & (colors[:, 2] >= threshold)
+            )
+
+        return mask
+
+
 def setup_vggt_path() -> None:
     """Add the local vggt submodule to sys.path for imports to work.
 
