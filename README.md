@@ -16,8 +16,32 @@ Build warping datasets by rendering VGGT depth point clouds into the next view. 
 - 📦 **Multi-Format Export**: Support for high-quality JPG/PNG images and binary PLY point clouds.
 - 🤖 **Dataset Integration**: One-click preparation for ModelScope and AI Toolkit training.
 
+## � Quick Start
+
+Already have Python 3.10+ and CUDA? Get your first warping dataset in two minutes:
+
+```bash
+# 1. Clone and install
+git clone --recurse-submodules <repo-url>
+cd vggt-dataset-builder
+uv venv --python 3.10 --seed && .venv\Scripts\activate  # Windows
+uv pip install torch==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+uv pip install -r requirements.txt
+
+# 2. Authenticate (one-time, for gated model access)
+uv run python -c "from huggingface_hub import login; login()"
+
+# 3. Add images to input/my-scene/ and run
+uv run python build_warp_dataset.py --upsample-depth --auto-s0 --max-megapixels 2.0
+```
+
+**Output:** Check `output/my-scene/` for rendered warping pairs (`*_splats.jpg`, `*_reference.jpg`, `*_target.jpg`).
+
+**Next:** See [Usage](#usage) for advanced options or [ModelScope Dataset](#modelscope-lora-training-dataset) for training prep.
+
 ## 📋 Table of Contents
 
+- [Quick Start](#-quick-start)
 - [Setup](#setup)
 - [Development](#development)
 - [Usage](#usage)
