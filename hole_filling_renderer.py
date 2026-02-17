@@ -684,10 +684,11 @@ void main() {
             (texture.height, texture.width, 4)
         )
         rgba = np.flipud(rgba)
-        rgba = np.clip(rgba, 0.0, 1.0)
-        # Keep alpha: the pipeline relies on premultiplication; dropping alpha (e.g., RGB8)
-        # can wash out splats and produce mostly-white outputs.
-        rgb = rgba[..., :3] * rgba[..., 3:4]
+        # ⚡ Bolt: Optimize readback by avoiding redundant CPU-side multiplication.
+        # The jfa_distance_mask.frag shader already performs alpha premultiplication
+        # and distance masking on the GPU, and outputs 1.0 in the alpha channel.
+        # This allows us to take the RGB channels directly, saving significant CPU cycles.
+        rgb = rgba[..., :3]
         return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
 
     def read_final_color(self) -> np.ndarray:

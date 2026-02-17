@@ -41,3 +41,7 @@
 ## 2026-02-15 - [Headless GPU Rendering]
 **Learning:** Running ModernGL-based rendering or tests in headless Linux environments will fail with `Exception: (standalone) XOpenDisplay: cannot open display`. Using `xvfb-run` provides the necessary virtual X server for the OpenGL context to initialize correctly.
 **Action:** Always wrap Python commands that use `HoleFillingRenderer` in `xvfb-run` when working in a remote or CI environment.
+
+## 2026-02-16 - [GPU-Accelerated Masking & Redundancy Removal]
+**Learning:** Moving alpha premultiplication and distance masking to the GPU significantly reduces CPU-side mathematical overhead (avoiding millions of multiplications per frame). While switching to uint8 readback is ideal for bandwidth, preserving the 4-channel float32 format can be necessary for architectural compatibility and precision requirements. Even without changing the texture format, removing redundant CPU-side masking provides a solid performance win.
+**Action:** Always check if shaders are already performing operations that are being redundantly repeated on the CPU; offload expensive masking to the GPU whenever possible.
