@@ -158,7 +158,7 @@ void main() {
         self.push_color_passes = self._init_push_passes()
         self.pull_color_passes = self._init_pull_passes()
         self.final_mask_pass = self._init_single_pass(
-            self.width, self.height, [(3, "u1")]
+            self.width, self.height, [(4, "f4")]
         )
         self.jfa_init_pass = self._init_jfa_seed_pass()
         self.jfa_step_passes = [self._init_jfa_seed_pass(), self._init_jfa_seed_pass()]
@@ -680,13 +680,16 @@ void main() {
     def _read_final_color(self) -> np.ndarray:
         texture = self.final_mask_pass.color_textures[0]
         data = texture.read()
-        # ⚡ Bolt: Fast GPU-to-CPU readback using uint8 texture.
-        # Alpha premultiplication and distance masking are now handled in the
-        # jfa_distance_mask.frag shader, allowing us to read 3-channel uint8 directly.
-        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
-            (texture.height, texture.width, 3)
+        rgba = np.frombuffer(data, dtype=np.float32).reshape(
+            (texture.height, texture.width, 4)
         )
-        return np.ascontiguousarray(np.flipud(rgb))
+        rgba = np.flipud(rgba)
+        # ⚡ Bolt: Optimize readback by avoiding redundant CPU-side multiplication.
+        # The jfa_distance_mask.frag shader already performs alpha premultiplication
+        # and distance masking on the GPU, and outputs 1.0 in the alpha channel.
+        # This allows us to take the RGB channels directly, saving significant CPU cycles.
+        rgb = rgba[..., :3]
+        return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
 
     def read_final_color(self) -> np.ndarray:
         """Public wrapper that returns the final rendered RGB image as uint8.

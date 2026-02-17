@@ -42,6 +42,6 @@
 **Learning:** Running ModernGL-based rendering or tests in headless Linux environments will fail with `Exception: (standalone) XOpenDisplay: cannot open display`. Using `xvfb-run` provides the necessary virtual X server for the OpenGL context to initialize correctly.
 **Action:** Always wrap Python commands that use `HoleFillingRenderer` in `xvfb-run` when working in a remote or CI environment.
 
-## 2026-02-16 - [Fast GPU-to-CPU Readback Refinement]
-**Learning:** Reading 4-channel float32 textures from GPU to CPU is bandwidth-heavy and requires expensive CPU-side clipping, scaling, and conversion. By leveraging existing GPU-side alpha premultiplication and masking in the fragment shader, we can switch to a 3-channel uint8 (RGB8) texture for the final pass. This reduces readback bandwidth by ~5.3x and eliminates significant CPU overhead, resulting in a measurable end-to-end performance gain for the renderer.
-**Action:** Always leverage GPU-side color processing to enable low-bandwidth uint8 texture readbacks for final outputs.
+## 2026-02-16 - [GPU-Accelerated Masking & Redundancy Removal]
+**Learning:** Moving alpha premultiplication and distance masking to the GPU significantly reduces CPU-side mathematical overhead (avoiding millions of multiplications per frame). While switching to uint8 readback is ideal for bandwidth, preserving the 4-channel float32 format can be necessary for architectural compatibility and precision requirements. Even without changing the texture format, removing redundant CPU-side masking provides a solid performance win.
+**Action:** Always check if shaders are already performing operations that are being redundantly repeated on the CPU; offload expensive masking to the GPU whenever possible.
