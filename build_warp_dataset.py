@@ -1,7 +1,6 @@
 import argparse
 import json
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 
@@ -27,7 +26,6 @@ import hashlib
 
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import (
-    unproject_depth_map_to_point_map,
     closed_form_inverse_se3,
 )
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -35,14 +33,12 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from hole_filling_renderer import HoleFillingRenderer
 
 try:
-    import cv2
     import onnxruntime
-    from vggt.visual_util import segment_sky, download_file_from_url
+    from vggt.visual_util import download_file_from_url
 
     SKY_FILTER_AVAILABLE = True
 except ImportError:
     SKY_FILTER_AVAILABLE = False
-    cv2 = None
     onnxruntime = None
 
 pillow_heif.register_heif_opener()
