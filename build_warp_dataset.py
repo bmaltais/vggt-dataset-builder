@@ -544,11 +544,11 @@ def build_preprocess_metadata(
     effective_sizes: list[tuple[int, int]] = []
 
     for path in image_paths:
+        # ⚡ Bolt: Skip unnecessary RGBA/RGB conversions for metadata-only operations.
+        # Image.size property works on any image mode without conversion overhead.
+        # RGBA handling and color conversion are deferred to actual image loading
+        # in frame pre-calculation when pixel data is accessed.
         with Image.open(path) as img:
-            if img.mode == "RGBA":
-                background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                img = Image.alpha_composite(background, img)
-            img = img.convert("RGB")
             width, height = img.size
 
         if mode == "pad":

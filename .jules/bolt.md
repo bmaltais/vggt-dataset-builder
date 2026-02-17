@@ -45,3 +45,8 @@
 ## 2026-02-16 - [GPU-Accelerated Masking & Redundancy Removal]
 **Learning:** Moving alpha premultiplication and distance masking to the GPU significantly reduces CPU-side mathematical overhead (avoiding millions of multiplications per frame). While switching to uint8 readback is ideal for bandwidth, preserving the 4-channel float32 format can be necessary for architectural compatibility and precision requirements. Even without changing the texture format, removing redundant CPU-side masking provides a solid performance win.
 **Action:** Always check if shaders are already performing operations that are being redundantly repeated on the CPU; offload expensive masking to the GPU whenever possible.
+
+## 2026-02-17 - [Unnecessary Image Mode Conversion for Metadata]
+**Learning:** In `build_preprocess_metadata()`, every image was being converted from RGBA → RGB even though only the image dimensions were needed. PIL's `Image.size` property works on any image mode without conversion overhead, so these operations were purely wasteful. Removing the RGBA composite and RGB conversion operations eliminates redundant CPU work for ~O(N) images per scene.
+**Action:** Always check if pixel-level operations (color conversions, compositing) are actually needed; dimension queries (`Image.size`) work natively on any image format and should skip conversion overhead.
+
