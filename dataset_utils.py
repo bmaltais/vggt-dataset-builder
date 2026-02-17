@@ -9,6 +9,8 @@ This module contains common functions used by multiple scripts including:
 Functions are organized to eliminate code duplication across the codebase.
 """
 
+import hashlib
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -45,6 +47,211 @@ try:
 except (ImportError, OSError):
     VGGT = None
     HAS_VGGT = False
+
+
+class FrameCacheManager:
+    """Manages frame caching for VGGT dataset processing.
+
+    Centralizes all cache-related operations: manifest validation, frame data
+    loading/saving, and cache invalidation on processing args changes.
+
+    This class encapsulates the previously scattered caching logic in build_warp_dataset.py,
+    providing a clean API for cache operations and improving testability.
+
+    Attributes:
+        scene_cache_dir: Path to the scene's cache directory.
+        args_hash: SHA1 hash of current processing args for cache invalidation.
+        manifest: Dict mapping image stems to their SHA1 signatures (for validation).
+    """
+
+    def __init__(self, scene_cache_dir: Path, args_hash: str) -> None:
+        """Initialize cache manager for a scene.
+
+        Args:
+            scene_cache_dir: Path to create/use for scene cache.
+            args_hash: SHA1 hash of current processing args. Cache is invalidated
+                       if args change when reloading manifest.
+
+        Returns:
+            None
+        """
+        self.scene_cache_dir = scene_cache_dir
+        self.args_hash = args_hash
+        self.manifest_path = scene_cache_dir / "manifest.json"
+        self.manifest = self._load_manifest()
+
+    def _load_manifest(self) -> dict:
+        """Load manifest from disk, invalidating cache if args_hash changed.
+
+        Returns:
+            Dict mapping image stems to SHA1 signatures, or empty dict if invalid/missing.
+        """
+        if not self.manifest_path.exists():
+            return {}
+
+        try:
+            with self.manifest_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+
+            # If args_hash changed, invalidate entire cache
+            if data.get("args_hash") != self.args_hash:
+                self.clear()
+                return {}
+
+            return data.get("images", {}) or {}
+        except Exception:
+            return {}
+
+    def _save_manifest(self) -> None:
+        """Save manifest (args_hash + image signatures) to disk."""
+        try:
+            self.scene_cache_dir.mkdir(parents=True, exist_ok=True)
+            with self.manifest_path.open("w", encoding="utf-8") as fh:
+                json.dump({"args_hash": self.args_hash, "images": self.manifest}, fh)
+        except Exception:
+            pass
+
+    def _image_signature(self, path: Path) -> str:
+        """Compute SHA1 signature of image file contents for change detection.
+
+        Args:
+            path: Path to the image file.
+
+        Returns:
+            SHA1 hexdigest, or empty string on error (treated as invalid).
+        """
+        try:
+            h = hashlib.sha1()
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(8192), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    def get_cache_path(self, image_path: Path) -> Path:
+        """Get the NPZ cache file path for an image.
+
+        Args:
+            image_path: Path to the source image.
+
+        Returns:
+            Path to the corresponding .npz cache file in scene_cache_dir.
+        """
+        return self.scene_cache_dir / f"{image_path.stem}.npz"
+
+    def is_frame_cached(self, image_path: Path, validate_file: bool = True) -> bool:
+        """Check if frame is cached and valid (file exists + signature matches).
+
+        Args:
+            image_path: Path to the image file.
+            validate_file: If True, validates both manifest entry and file existence.
+                          If False, only checks if manifest entry exists.
+
+        Returns:
+            True if frame is cached and valid, False otherwise.
+        """
+        cache_path = self.get_cache_path(image_path)
+
+        if not cache_path.exists():
+            return False
+
+        if not validate_file:
+            return True
+
+        # Verify signature matches to ensure image hasn't changed
+        sig = self._image_signature(image_path)
+        if not sig:
+            return False
+
+        cached_sig = self.manifest.get(image_path.stem)
+        return cached_sig == sig
+
+    def load_frame_data(self, image_path: Path) -> dict | None:
+        """Load frame data from cache.
+
+        Args:
+            image_path: Path to the image file.
+
+        Returns:
+            Frame data dict with keys 'points', 'colors', 'confidences' (required),
+            and optionally 's0' and 'conf_image'. Returns None if not cached or invalid.
+
+        Raises:
+            None: Errors are caught and None is returned.
+        """
+        if not self.is_frame_cached(image_path):
+            return None
+
+        cache_path = self.get_cache_path(image_path)
+        try:
+            data = np.load(cache_path, allow_pickle=False)
+            frame_data = {
+                "points": data["points"],
+                "colors": data["colors"],
+                "confidences": data["confidences"],
+            }
+            if "s0" in data:
+                frame_data["s0"] = float(data["s0"].tolist())
+            if "conf_image" in data:
+                frame_data["conf_image"] = Image.fromarray(
+                    data["conf_image"].astype(np.uint8)
+                )
+            return frame_data
+        except Exception:
+            return None
+
+    def save_frame_data(self, image_path: Path, frame_data: dict) -> None:
+        """Save frame data to cache and update manifest.
+
+        Args:
+            image_path: Path to the image file.
+            frame_data: Dict with keys 'points', 'colors', 'confidences' (required),
+                       and optionally 's0' (float) and 'conf_image' (PIL Image).
+
+        Returns:
+            None
+
+        Raises:
+            None: Errors are caught and silently ignored (cache not critical).
+        """
+        cache_path = self.get_cache_path(image_path)
+
+        try:
+            self.scene_cache_dir.mkdir(parents=True, exist_ok=True)
+
+            arrs = {
+                "points": frame_data["points"],
+                "colors": frame_data["colors"],
+                "confidences": frame_data["confidences"],
+            }
+            if "s0" in frame_data:
+                arrs["s0"] = np.array(float(frame_data["s0"]))
+            if "conf_image" in frame_data:
+                arrs["conf_image"] = np.array(frame_data["conf_image"], dtype=np.uint8)
+
+            np.savez_compressed(cache_path, **arrs)
+
+            # Update manifest with image signature
+            sig = self._image_signature(image_path)
+            if sig:
+                self.manifest[image_path.stem] = sig
+                self._save_manifest()
+        except Exception:
+            pass
+
+    def clear(self) -> None:
+        """Clear all cached data for this scene.
+
+        Returns:
+            None
+        """
+        try:
+            if self.scene_cache_dir.exists():
+                shutil.rmtree(self.scene_cache_dir)
+        except Exception:
+            pass
+        self.manifest = {}
 
 
 def setup_vggt_path() -> None:

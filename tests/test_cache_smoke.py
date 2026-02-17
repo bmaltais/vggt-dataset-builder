@@ -1,41 +1,26 @@
 from pathlib import Path
-import importlib.util
-import sys
 import numpy as np
 import pytest
-
-# Load build_warp_dataset module by path to avoid import issues
-root = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location(
-    "build_warp_dataset", str(root / "build_warp_dataset.py")
-)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-import types
-
-# Store original module state to restore later
-_original_hole_filling_renderer = sys.modules.get("hole_filling_renderer")
-
-# Provide a minimal dummy for hole_filling_renderer to avoid importing heavy runtime deps
-sys.modules["hole_filling_renderer"] = types.SimpleNamespace(HoleFillingRenderer=object)
-spec.loader.exec_module(module)
-
-save_frame_cache = module.save_frame_cache
-load_frame_cache = module.load_frame_cache
-_cache_file_for_image = module._cache_file_for_image
-
-# IMMEDIATELY restore sys.modules to avoid polluting other tests
-if _original_hole_filling_renderer is not None:
-    sys.modules["hole_filling_renderer"] = _original_hole_filling_renderer
-else:
-    sys.modules.pop("hole_filling_renderer", None)
+from dataset_utils import FrameCacheManager
 
 
 def test_cache_smoke():
-    """Test frame cache save/load functionality without importing heavy renderer deps."""
+    """Test frame cache save/load functionality with FrameCacheManager."""
     scene_cache = Path(".cache") / "smoke_scene"
-    scene_cache.mkdir(parents=True, exist_ok=True)
-    cache_path = scene_cache / "test_image.npz"
+
+    # Clean up cache before test
+    import shutil
+
+    if scene_cache.exists():
+        shutil.rmtree(scene_cache)
+
+    args_hash = "test_hash_123"
+    cache_mgr = FrameCacheManager(scene_cache, args_hash)
+
+    # Create a temp image file for testing
+    test_image_path = Path(".cache") / "test_image.tmp"
+    test_image_path.parent.mkdir(parents=True, exist_ok=True)
+    test_image_path.write_bytes(b"test image data")
 
     frame = {
         "points": np.random.rand(5, 3).astype(np.float32),
@@ -44,10 +29,13 @@ def test_cache_smoke():
         "s0": 0.123,
     }
 
-    print("Saving cache to", cache_path)
-    save_frame_cache(cache_path, frame)
-    loaded = load_frame_cache(cache_path)
-    print("Loaded keys:", list(loaded.keys()))
+    print("Saving cache using FrameCacheManager")
+    cache_mgr.save_frame_data(test_image_path, frame)
+
+    assert cache_mgr.is_frame_cached(test_image_path), "Frame should be cached"
+
+    loaded = cache_mgr.load_frame_data(test_image_path)
+    print("Loaded keys:", list(loaded.keys()) if loaded else "None")
     print("points shape:", loaded["points"].shape)
     print("colors shape:", loaded["colors"].shape)
     print("confidences shape:", loaded["confidences"].shape)
@@ -61,3 +49,10 @@ def test_cache_smoke():
     assert loaded["colors"].shape == (5, 3)
     assert loaded["confidences"].shape == (5,)
     assert loaded["s0"] == 0.123
+    # Clean up
+    import shutil
+
+    if scene_cache.exists():
+        shutil.rmtree(scene_cache)
+    if test_image_path.exists():
+        test_image_path.unlink()
