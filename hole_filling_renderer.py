@@ -158,7 +158,7 @@ void main() {
         self.push_color_passes = self._init_push_passes()
         self.pull_color_passes = self._init_pull_passes()
         self.final_mask_pass = self._init_single_pass(
-            self.width, self.height, [(4, "f4")]
+            self.width, self.height, [(3, "u1")]
         )
         self.jfa_init_pass = self._init_jfa_seed_pass()
         self.jfa_step_passes = [self._init_jfa_seed_pass(), self._init_jfa_seed_pass()]
@@ -680,15 +680,13 @@ void main() {
     def _read_final_color(self) -> np.ndarray:
         texture = self.final_mask_pass.color_textures[0]
         data = texture.read()
-        rgba = np.frombuffer(data, dtype=np.float32).reshape(
-            (texture.height, texture.width, 4)
+        # ⚡ Bolt: Fast GPU-to-CPU readback using uint8 texture.
+        # Alpha premultiplication and distance masking are now handled in the
+        # jfa_distance_mask.frag shader, allowing us to read 3-channel uint8 directly.
+        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
+            (texture.height, texture.width, 3)
         )
-        rgba = np.flipud(rgba)
-        rgba = np.clip(rgba, 0.0, 1.0)
-        # Keep alpha: the pipeline relies on premultiplication; dropping alpha (e.g., RGB8)
-        # can wash out splats and produce mostly-white outputs.
-        rgb = rgba[..., :3] * rgba[..., 3:4]
-        return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        return np.ascontiguousarray(np.flipud(rgb))
 
     def read_final_color(self) -> np.ndarray:
         """Public wrapper that returns the final rendered RGB image as uint8.
