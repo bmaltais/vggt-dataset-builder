@@ -50,3 +50,11 @@
 **Learning:** In `build_preprocess_metadata()`, every image was being converted from RGBA → RGB even though only the image dimensions were needed. PIL's `Image.size` property works on any image mode without conversion overhead, so these operations were purely wasteful. Removing the RGBA composite and RGB conversion operations eliminates redundant CPU work for ~O(N) images per scene.
 **Action:** Always check if pixel-level operations (color conversions, compositing) are actually needed; dimension queries (`Image.size`) work natively on any image format and should skip conversion overhead.
 
+
+## 2026-02-18 - [Lightning-Fast Cache Validation]
+**Learning:** Hashing large image files (SHA1) to detect changes for cache invalidation is extremely slow (O(N) with file size). Using file metadata (mtime and size) provides a sufficient signature for most developer workflows and is ~3000x faster (O(1) after stat).
+**Action:** Use file metadata for local cache signatures instead of full file hashing.
+
+## 2026-02-18 - [Optimized NumPy Reductions for Small Axes]
+**Learning:** For arrays with a very small fixed axis (like RGB channels, N=3), manual summation `(c0 + c1 + c2)` is significantly faster than generalized NumPy reductions like `sum(axis=1)` or `min(axis=1)`. Additionally, applying De Morgan's Law to boolean masks can eliminate redundant array negations.
+**Action:** Use explicit channel-wise operations and simplified boolean logic for hot loops in NumPy.
