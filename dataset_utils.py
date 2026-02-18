@@ -124,7 +124,7 @@ class FrameCacheManager:
         """
         try:
             stat = path.stat()
-            return f"{stat.st_mtime}_{stat.st_size}"
+            return f"{stat.st_mtime_ns}_{stat.st_size}"
         except Exception:
             return ""
 
