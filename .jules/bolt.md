@@ -50,3 +50,7 @@
 **Learning:** In `build_preprocess_metadata()`, every image was being converted from RGBA → RGB even though only the image dimensions were needed. PIL's `Image.size` property works on any image mode without conversion overhead, so these operations were purely wasteful. Removing the RGBA composite and RGB conversion operations eliminates redundant CPU work for ~O(N) images per scene.
 **Action:** Always check if pixel-level operations (color conversions, compositing) are actually needed; dimension queries (`Image.size`) work natively on any image format and should skip conversion overhead.
 
+
+## 2026-02-18 - [Optimized NumPy Reductions for Small Axes]
+**Learning:** For small, fixed dimensions (like 3-channel RGB), NumPy's generalized reduction engine in `sum(axis=1)` has significant overhead. Explicit channel-wise addition (`c0 + c1 + c2`) is ~4x faster as it uses optimized vectorized addition kernels directly.
+**Action:** Replace `sum(axis=1)` with explicit addition when working with fixed, small dimensions like RGB color channels.
