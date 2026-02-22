@@ -52,9 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preprocess-mode",
         type=str,
-        default="crop",
+        default="pad",
         choices=["crop", "pad"],
-        help="Preprocessing mode before VGGT inference (default: crop).",
+        help="Preprocessing mode before VGGT inference (default: pad).",
     )
     parser.add_argument(
         "--device",
@@ -485,6 +485,13 @@ def main() -> None:
     if args.resize_width > 0 and args.resize_height > 0:
         resize_size = (args.resize_width, args.resize_height)
 
+    input_size = None
+    try:
+        with Image.open(args.images[0]) as img:
+            input_size = img.size
+    except Exception:
+        input_size = None
+
     missing = [path for path in args.images if not path.exists()]
     if missing:
         missing_text = ", ".join(str(path) for path in missing)
@@ -591,6 +598,7 @@ def main() -> None:
             sigma,
             occlusion_threshold,
             coarse_level,
+            display_aspect: float | None = None,
             resizable: bool = True,
         ):
             if window_size is None:
@@ -653,10 +661,13 @@ def main() -> None:
             self.render_size: tuple[int, int] | None = None
             self.ctx: moderngl.Context | None = None
 
-            # Source aspect ratio (point-map width / height) — keep this fixed
-            self.source_aspect = float(self.model_size[0]) / max(
-                float(self.model_size[1]), 1.0
-            )
+            # Source aspect ratio (prefer input image aspect when provided)
+            if display_aspect is not None and display_aspect > 0.0:
+                self.source_aspect = float(display_aspect)
+            else:
+                self.source_aspect = float(self.model_size[0]) / max(
+                    float(self.model_size[1]), 1.0
+                )
             # Current full-window size (framebuffer) and computed sub-viewport (x,y,w,h)
             self.window_size_current: tuple[int, int] = (width, height)
             self._viewport: tuple[int, int, int, int] = (0, 0, width, height)
@@ -910,8 +921,24 @@ def main() -> None:
         def _compute_viewport(
             self, win_w: int, win_h: int
         ) -> tuple[int, int, int, int]:
-            # For expand-to-fill behavior we use the full window as the viewport.
-            return (0, 0, max(int(win_w), 1), max(int(win_h), 1))
+            # Compute a centered sub-viewport that preserves the source aspect.
+            width = max(int(win_w), 1)
+            height = max(int(win_h), 1)
+            win_aspect = float(width) / max(float(height), 1.0)
+            src_aspect = max(float(self.source_aspect), 1e-6)
+
+            if win_aspect > src_aspect:
+                # Window is wider than source: pillarbox
+                eff_h = height
+                eff_w = max(1, int(round(eff_h * src_aspect)))
+            else:
+                # Window is taller than source: letterbox
+                eff_w = width
+                eff_h = max(1, int(round(eff_w / src_aspect)))
+
+            x = max(0, (width - eff_w) // 2)
+            y = max(0, (height - eff_h) // 2)
+            return (x, y, eff_w, eff_h)
 
         def _update_viewport_and_projection(self, win_w: int, win_h: int) -> None:
             self.window_size_current = (win_w, win_h)
@@ -928,6 +955,9 @@ def main() -> None:
                 pass
 
         def on_resize(self, width: int, height: int) -> None:
+            if self.fixed_render_size is None:
+                # When user resizes freely, fill the full window to avoid bars.
+                self.source_aspect = float(width) / max(float(height), 1.0)
             self._update_viewport_and_projection(width, height)
             # Recreate renderer immediately to match new size
             try:
@@ -1036,7 +1066,13 @@ def main() -> None:
             if hasattr(self.renderer, "render_to_screen"):
                 try:
                     self.renderer.render_to_screen(
-                        self.vertices, colors, self.confidences, view, proj, fov_y
+                        self.vertices,
+                        colors,
+                        self.confidences,
+                        view,
+                        proj,
+                        fov_y,
+                        viewport=(vp_x, vp_y, vp_w, vp_h),
                     )
                 except Exception as e:
                     print(f"[viewer] render_to_screen failed: {e}")
@@ -1199,7 +1235,7 @@ def main() -> None:
             except Exception:
                 pass
 
-        def _clear_move_state(self, key: str, dt: float) -> None:
+        def _clear_move_state(self, key: str, dt: float | None = None) -> None:
             # Helper used by scheduled callbacks to clear transient move state
             try:
                 if key in self.move_state:
@@ -1408,6 +1444,12 @@ def main() -> None:
     if args.viewport_width > 0 and args.viewport_height > 0:
         window_size = (args.viewport_width, args.viewport_height)
 
+    display_aspect = None
+    if window_size is not None:
+        display_aspect = float(window_size[0]) / max(float(window_size[1]), 1.0)
+    elif input_size is not None and args.preprocess_mode == "pad":
+        display_aspect = float(input_size[0]) / max(float(input_size[1]), 1.0)
+
     viewer = PointCloudViewer(
         points,
         point_colors,
@@ -1425,8 +1467,21 @@ def main() -> None:
         args.sigma,
         args.occlusion_threshold,
         args.coarse_level,
+        display_aspect,
         resizable=True,
     )
+    if window_size is None and display_aspect is not None:
+        max_dim = max(int(point_map_size[0]), int(point_map_size[1]), 1)
+        if display_aspect >= 1.0:
+            init_w = max_dim
+            init_h = max(1, int(round(max_dim / display_aspect)))
+        else:
+            init_h = max_dim
+            init_w = max(1, int(round(max_dim * display_aspect)))
+        try:
+            viewer.set_size(init_w, init_h)
+        except Exception:
+            pass
     pyglet.app.run()
 
 

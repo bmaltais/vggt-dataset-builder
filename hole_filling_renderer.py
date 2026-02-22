@@ -229,6 +229,7 @@ void main() {
         view_mat: np.ndarray,
         proj_mat: np.ndarray,
         fov_y: float,
+        viewport: tuple[int, int, int, int] | None = None,
     ) -> None:
         """Render the point cloud directly into the current OpenGL default framebuffer.
 
@@ -270,7 +271,15 @@ void main() {
             except AttributeError:
                 # fallback: use None
                 pass
-            self.ctx.viewport = (0, 0, self.width, self.height)
+            if viewport is None:
+                self.ctx.viewport = (0, 0, self.width, self.height)
+            else:
+                self.ctx.viewport = (
+                    int(viewport[0]),
+                    int(viewport[1]),
+                    max(int(viewport[2]), 1),
+                    max(int(viewport[3]), 1),
+                )
             texture = self.final_mask_pass.color_textures[0]
             texture.use(0)
             self.blit_program["u_tex"].value = 0
