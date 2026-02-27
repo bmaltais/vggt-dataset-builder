@@ -54,3 +54,7 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-25 - [Implicit Alignment in ModernGL Readback]
+**Learning:** When switching from 4-channel float32 to 3-channel uint8 textures, there is a risk of alignment issues (OpenGL default is 4-byte padding). However, ModernGL's `texture.read()` in this environment appears to handle this implicitly or defaults to 1-byte alignment, as non-4-byte-multiple widths (e.g., 127 pixels) work correctly without explicit `pack_alignment` configuration.
+**Action:** Always verify readback with odd-numbered widths when using 3-channel formats to ensure no alignment-related crashes or data corruption.
