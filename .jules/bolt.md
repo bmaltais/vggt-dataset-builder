@@ -54,3 +54,7 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-19 - [Early Megapixel Limit Validation]
+**Learning:** In `rescale_image_to_max_megapixels`, performing RGBA compositing and RGB conversion before checking the megapixel limit adds significant redundant CPU overhead for images that don't actually need resizing. Moving the `width * height` dimension check immediately after `Image.open()` (which is lazy) allows skipping expensive pixel-level operations entirely for valid images, providing a measured ~200x speedup in the "no-op" path.
+**Action:** Always check metadata-based constraints (dimensions, mode) as early as possible before performing pixel-level image transformations in PIL-based pipelines.

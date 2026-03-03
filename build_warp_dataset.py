@@ -313,14 +313,18 @@ def rescale_image_to_max_megapixels(
     if max_megapixels <= 0:
         return path
     with Image.open(path) as img:
-        if img.mode == "RGBA":
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(background, img)
-        img = img.convert("RGB")
+        # ⚡ Bolt: Check megapixel limit first to avoid expensive RGBA/RGB conversions
+        # for images that are already within the limit.
         width, height = img.size
         megapixels = (width * height) / 1_000_000
         if megapixels <= max_megapixels:
             return path
+
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        img = img.convert("RGB")
+
         scale = (max_megapixels / megapixels) ** 0.5
         new_width = max(1, int(round(width * scale)))
         new_height = max(1, int(round(height * scale)))
