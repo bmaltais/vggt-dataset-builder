@@ -54,3 +54,27 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-19 - [Vectorized Boundary Filtering for Sequences]
+**Learning:** Using nested Python loops to apply boundary masks to large image sequences (S, H, W) is extremely inefficient. NumPy's multidimensional slicing allows zero-copy or high-speed vectorized assignment across the entire batch at once.
+**Action:** Replace nested loops iterating over frames/rows with 3D NumPy slicing () for batch processing.
+
+## 2026-02-19 - [Broadcasting for Uniform Point Properties]
+**Learning:** Allocating full-sized arrays for point properties that are uniform across the entire cloud (like log-scales or identity quaternions) is wasteful. NumPy structured arrays allow assigning a scalar to a column, which uses broadcasting internally and avoids redundant memory allocations and mathematical operations (like ) on millions of identical values.
+**Action:** Use scalar broadcasting when assigning uniform properties to large structured arrays instead of pre-filling temporary arrays.
+
+## 2026-02-19 - [Early Exit for Image Rescaling]
+**Learning:** Performing expensive RGBA compositing and RGB conversion *before* checking if an image even needs to be rescaled is purely wasteful. PIL's  is available immediately after  and can be used to skip all pixel-level processing for images already within limits.
+**Action:** Always check dimensions and metadata before performing pixel-level operations (conversions, compositing) to enable early exits.
+
+## 2026-02-19 - [Vectorized Boundary Filtering for Sequences]
+**Learning:** Using nested Python loops to apply boundary masks to large image sequences (S, H, W) is extremely inefficient. NumPy's multidimensional slicing allows zero-copy or high-speed vectorized assignment across the entire batch at once.
+**Action:** Replace nested loops iterating over frames/rows with 3D NumPy slicing (`mask[:, :threshold, :] = False`) for batch processing.
+
+## 2026-02-19 - [Broadcasting for Uniform Point Properties]
+**Learning:** Allocating full-sized arrays for point properties that are uniform across the entire cloud (like log-scales or identity quaternions) is wasteful. NumPy structured arrays allow assigning a scalar to a column, which uses broadcasting internally and avoids redundant memory allocations and mathematical operations (like `np.log`) on millions of identical values.
+**Action:** Use scalar broadcasting when assigning uniform properties to large structured arrays instead of pre-filling temporary arrays.
+
+## 2026-02-19 - [Early Exit for Image Rescaling]
+**Learning:** Performing expensive RGBA compositing and RGB conversion *before* checking if an image even needs to be rescaled is purely wasteful. PIL's `Image.size` is available immediately after `Image.open()` and can be used to skip all pixel-level processing for images already within limits.
+**Action:** Always check dimensions and metadata before performing pixel-level operations (conversions, compositing) to enable early exits.
