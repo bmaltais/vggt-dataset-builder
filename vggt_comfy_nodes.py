@@ -154,14 +154,15 @@ def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
     else:
         avg_point_distance = 0.1
 
-    # Create per-point scales
-    point_scales = (
-        np.ones((n_points, 3), dtype=np.float32) * avg_point_distance * scale_multiplier
-    )
-    scales = np.log(point_scales)
+    # ⚡ Bolt: Optimize point cloud attribute generation.
+    # Compute log-scale once as a scalar to avoid element-wise log on millions of points.
+    log_scale = np.log(avg_point_distance * scale_multiplier)
+    scales = np.full((n_points, 3), log_scale, dtype=np.float32)
 
-    # Default quaternion (identity rotation) for all points
-    quaternions = np.tile([1.0, 0.0, 0.0, 0.0], (n_points, 1)).astype(np.float32)
+    # ⚡ Bolt: Use zeros and column assignment for quaternions to avoid np.tile overhead.
+    # Default quaternion is (1, 0, 0, 0) - identity rotation.
+    quaternions = np.zeros((n_points, 4), dtype=np.float32)
+    quaternions[:, 0] = 1.0
 
     # Convert opacity to logits using inverse sigmoid
     # Clamp confidences to valid range
@@ -796,25 +797,14 @@ class VGGT_Model_Inference:
 
         # Apply boundary filtering to all frames
         if boundary_threshold > 0:
-            # Create boundary mask for each frame
-            boundary_mask = np.ones(S * H * W, dtype=bool)
-            for s in range(S):
-                frame_offset = s * H * W
-                # Top and bottom
-                boundary_mask[frame_offset : frame_offset + boundary_threshold * W] = (
-                    False
-                )
-                boundary_mask[
-                    frame_offset + (H - boundary_threshold) * W : frame_offset + H * W
-                ] = False
-                # Left and right (per row)
-                for h in range(boundary_threshold, H - boundary_threshold):
-                    row_start = frame_offset + h * W
-                    boundary_mask[row_start : row_start + boundary_threshold] = False
-                    boundary_mask[
-                        row_start + W - boundary_threshold : row_start + W
-                    ] = False
-            valid_mask_all = valid_mask_all & boundary_mask
+            # ⚡ Bolt: Use vectorized slicing on a reshaped array to replace nested Python loops.
+            # This avoids O(S * H) Python loop iterations.
+            boundary_mask = np.ones((S, H, W), dtype=bool)
+            boundary_mask[:, :boundary_threshold, :] = False
+            boundary_mask[:, -boundary_threshold:, :] = False
+            boundary_mask[:, :, :boundary_threshold] = False
+            boundary_mask[:, :, -boundary_threshold:] = False
+            valid_mask_all = valid_mask_all & boundary_mask.ravel()
             print(f"[VGGT] Applied boundary_threshold filter: {boundary_threshold}px")
 
         # Apply black/white background filtering
