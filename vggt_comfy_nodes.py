@@ -734,9 +734,8 @@ class VGGT_Model_Inference:
 
         # Use MODEL INPUT IMAGES (resized to match world points) for colors
         # Keep in [0, 1] range - write_ply_basic handles conversion to SH coefficients
-        colors_all_frames = model_input_np.reshape(-1, 3).astype(
-            np.float32
-        )  # (S*H*W, 3) in [0, 1]
+        # ⚡ Bolt: Defer float32 conversion to reduce memory pressure during filtering.
+        colors_all_frames = model_input_np.reshape(-1, 3)
 
         # Flatten confidence scores
         if depth_conf.ndim == 4:
@@ -796,25 +795,14 @@ class VGGT_Model_Inference:
 
         # Apply boundary filtering to all frames
         if boundary_threshold > 0:
-            # Create boundary mask for each frame
-            boundary_mask = np.ones(S * H * W, dtype=bool)
-            for s in range(S):
-                frame_offset = s * H * W
-                # Top and bottom
-                boundary_mask[frame_offset : frame_offset + boundary_threshold * W] = (
-                    False
-                )
-                boundary_mask[
-                    frame_offset + (H - boundary_threshold) * W : frame_offset + H * W
-                ] = False
-                # Left and right (per row)
-                for h in range(boundary_threshold, H - boundary_threshold):
-                    row_start = frame_offset + h * W
-                    boundary_mask[row_start : row_start + boundary_threshold] = False
-                    boundary_mask[
-                        row_start + W - boundary_threshold : row_start + W
-                    ] = False
-            valid_mask_all = valid_mask_all & boundary_mask
+            # ⚡ Bolt: Use vectorized slicing on reshaped array to avoid slow Python loops.
+            # Using .ravel() instead of .flatten() avoids an unnecessary memory copy.
+            boundary_mask = np.ones((S, H, W), dtype=bool)
+            boundary_mask[:, :boundary_threshold, :] = False
+            boundary_mask[:, -boundary_threshold:, :] = False
+            boundary_mask[:, :, :boundary_threshold] = False
+            boundary_mask[:, :, -boundary_threshold:] = False
+            valid_mask_all = valid_mask_all & boundary_mask.ravel()
             print(f"[VGGT] Applied boundary_threshold filter: {boundary_threshold}px")
 
         # Apply black/white background filtering
@@ -946,7 +934,8 @@ class VGGT_Model_Inference:
         del model_input_np
 
         points = points_all_frames[valid_mask_all]
-        colors = colors_all_frames[valid_mask_all]
+        # ⚡ Bolt: Only convert and copy colors for valid points to float32
+        colors = colors_all_frames[valid_mask_all].astype(np.float32)
         confidences = conf_all_frames[valid_mask_all]
 
         print(f"[VGGT] Confidence threshold: {depth_conf_threshold}")
