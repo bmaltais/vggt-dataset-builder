@@ -54,3 +54,7 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-19 - [Vectorized Boundary Filtering & Optimized PLY Export]
+**Learning:** Nested Python loops for 3D array spatial filtering (like boundary cropping) are extremely slow (~250x penalty). Reshaping a 1D mask to 3D and using NumPy slicing is near-instant. Additionally, constructing structured arrays for PLY files can be optimized by using `np.empty` and direct broadcasting of constant scalars (scales, rotations) to columns, avoiding multiple large intermediate array allocations and redundant operations like `np.tile`.
+**Action:** Always replace nested spatial loops with NumPy slicing; use broadcasting and structured array views for efficient binary file construction.
