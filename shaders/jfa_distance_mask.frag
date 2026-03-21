@@ -4,7 +4,7 @@ uniform sampler2D u_tex_source;
 uniform sampler2D u_tex_dist;
 uniform float u_sigma;
 
-layout(location = 0) out vec4 o_dest;
+layout(location = 0) out vec3 o_dest;
 
 void main(void) {
 	ivec2 coord = ivec2(gl_FragCoord.xy);
@@ -17,5 +17,5 @@ void main(void) {
 	// ⚡ Bolt: Perform alpha premultiplication and distance masking on the GPU.
 	// We use factor * factor to match the original CPU-side behavior where factor
 	// was effectively applied twice (once in shader, once during alpha multiplication).
-	o_dest = vec4(sample_source.xyz * sample_source.w * factor * factor, 1.0);
+	o_dest = clamp(sample_source.xyz * sample_source.w * factor * factor, 0.0, 1.0);
 }
