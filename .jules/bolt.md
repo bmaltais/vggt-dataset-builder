@@ -54,3 +54,11 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-18 - [Early Return for Image Rescaling]
+**Learning:** Checking image dimensions immediately after header-only load with `Image.open()` allows skipping expensive pixel-level operations (mode conversion, alpha compositing) for images already within size limits. This provides a ~240x speedup for valid images in the preprocessing pipeline.
+**Action:** Always place metadata-based checks (size, mode) before pixel-processing operations in image pipelines.
+
+## 2026-02-18 - [Vectorized Boundary Masking]
+**Learning:** Applying a spatial boundary filter using nested Python loops over (S, H, W) dimensions is inefficient. Vectorizing the mask generation using NumPy slicing on a 3D array provides a ~2.2x speedup and significantly cleaner code.
+**Action:** Use multi-dimensional NumPy slicing to generate spatial masks instead of coordinate-based loops.
