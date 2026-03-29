@@ -157,8 +157,10 @@ void main() {
         )
         self.push_color_passes = self._init_push_passes()
         self.pull_color_passes = self._init_pull_passes()
+        # ⚡ Bolt: Use a 3-component uint8 (u1) texture for the final pass.
+        # This reduces readback bandwidth by 5.3x and eliminates CPU-side float math.
         self.final_mask_pass = self._init_single_pass(
-            self.width, self.height, [(4, "f4")]
+            self.width, self.height, [(3, "u1")]
         )
         self.jfa_init_pass = self._init_jfa_seed_pass()
         self.jfa_step_passes = [self._init_jfa_seed_pass(), self._init_jfa_seed_pass()]
@@ -687,18 +689,17 @@ void main() {
         quad.render(mode=moderngl.TRIANGLE_STRIP)
 
     def _read_final_color(self) -> np.ndarray:
+        # ⚡ Bolt: Optimize readback by using uint8 (u1) textures on the GPU.
+        # This reduces data transfer by ~5x and eliminates expensive CPU-side
+        # float32 -> uint8 conversion and clipping.
         texture = self.final_mask_pass.color_textures[0]
         data = texture.read()
-        rgba = np.frombuffer(data, dtype=np.float32).reshape(
-            (texture.height, texture.width, 4)
+        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
+            (texture.height, texture.width, 3)
         )
-        rgba = np.flipud(rgba)
-        # ⚡ Bolt: Optimize readback by avoiding redundant CPU-side multiplication.
-        # The jfa_distance_mask.frag shader already performs alpha premultiplication
-        # and distance masking on the GPU, and outputs 1.0 in the alpha channel.
-        # This allows us to take the RGB channels directly, saving significant CPU cycles.
-        rgb = rgba[..., :3]
-        return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        # Perform vertical flip on CPU; np.flipud is very efficient.
+        # We return a contiguous array for better performance in downstream tasks.
+        return np.ascontiguousarray(np.flipud(rgb))
 
     def read_final_color(self) -> np.ndarray:
         """Public wrapper that returns the final rendered RGB image as uint8.
