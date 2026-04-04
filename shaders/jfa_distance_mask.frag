@@ -17,5 +17,6 @@ void main(void) {
 	// ⚡ Bolt: Perform alpha premultiplication and distance masking on the GPU.
 	// We use factor * factor to match the original CPU-side behavior where factor
 	// was effectively applied twice (once in shader, once during alpha multiplication).
-	o_dest = vec4(sample_source.xyz * sample_source.w * factor * factor, 1.0);
+	// clamp(..., 0.0, 1.0) ensures correct mapping to normalized uint8 textures.
+	o_dest = vec4(clamp(sample_source.xyz * sample_source.w * factor * factor, 0.0, 1.0), 1.0);
 }
