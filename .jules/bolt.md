@@ -54,3 +54,7 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-04-25 - [Vectorized 3D Boundary Filtering]
+**Learning:** In ComfyUI nodes processing frame sequences (S, H, W), implementing boundary filtering with nested Python loops (O(S*H)) is a massive bottleneck. Reshaping the flat mask into a 3D view and using NumPy slicing allows performing the entire operation in four vectorized operations.
+**Action:** Use `.reshape(S, H, W)` on flat masks to perform vectorized boundary filtering via slice assignment for significant speedups.
