@@ -54,3 +54,7 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-19 - [Optimized GPU-to-CPU Readback for Rendering]
+**Learning:** Reading back float32 textures from the GPU (e.g., 4-channel float32 at 16 bytes/pixel) is highly bandwidth-intensive and requires significant CPU overhead for clamping, scaling, and quantization. Using a 3-channel normalized uint8 texture (`f1` in ModernGL) reduces bandwidth by ~5.3x and allows reading back `np.uint8` directly, completely eliminating the need for CPU-side mathematical post-processing.
+**Action:** Always prefer normalized uint8 textures for final render outputs to minimize transfer bandwidth and CPU-side post-processing overhead. Ensure shader outputs are clamped to [0, 1] to prevent mapping artifacts during hardware quantization.
