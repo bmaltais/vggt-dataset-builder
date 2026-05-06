@@ -789,32 +789,28 @@ class VGGT_Model_Inference:
 
         # Apply max depth filtering to all frames
         if max_depth > 0:
-            # Compute depth as distance from camera (simple approximation)
-            depth_all = np.linalg.norm(points_all_frames, axis=1)
-            valid_mask_all = valid_mask_all & (depth_all <= max_depth)
+            # ⚡ Bolt: Replace np.linalg.norm with squared distance comparison.
+            # This avoids the expensive square root operation for every point.
+            # (x^2 + y^2 + z^2) <= max_depth^2 is mathematically equivalent to linalg.norm(points) <= max_depth
+            sq_dist = (
+                points_all_frames[:, 0] ** 2
+                + points_all_frames[:, 1] ** 2
+                + points_all_frames[:, 2] ** 2
+            )
+            valid_mask_all = valid_mask_all & (sq_dist <= max_depth**2)
             print(f"[VGGT] Applied max_depth filter: {max_depth}")
 
         # Apply boundary filtering to all frames
         if boundary_threshold > 0:
-            # Create boundary mask for each frame
-            boundary_mask = np.ones(S * H * W, dtype=bool)
-            for s in range(S):
-                frame_offset = s * H * W
-                # Top and bottom
-                boundary_mask[frame_offset : frame_offset + boundary_threshold * W] = (
-                    False
-                )
-                boundary_mask[
-                    frame_offset + (H - boundary_threshold) * W : frame_offset + H * W
-                ] = False
-                # Left and right (per row)
-                for h in range(boundary_threshold, H - boundary_threshold):
-                    row_start = frame_offset + h * W
-                    boundary_mask[row_start : row_start + boundary_threshold] = False
-                    boundary_mask[
-                        row_start + W - boundary_threshold : row_start + W
-                    ] = False
-            valid_mask_all = valid_mask_all & boundary_mask
+            # ⚡ Bolt: Vectorize boundary filtering using NumPy slice assignments.
+            # Reshaping to (S, H, W) allows us to mask all frames' boundaries in four operations,
+            # avoiding a nested Python loop that scales with the number of frames and height.
+            valid_mask_all = valid_mask_all.reshape(S, H, W)
+            valid_mask_all[:, :boundary_threshold, :] = False  # Top
+            valid_mask_all[:, -boundary_threshold:, :] = False  # Bottom
+            valid_mask_all[:, :, :boundary_threshold] = False  # Left
+            valid_mask_all[:, :, -boundary_threshold:] = False  # Right
+            valid_mask_all = valid_mask_all.ravel()
             print(f"[VGGT] Applied boundary_threshold filter: {boundary_threshold}px")
 
         # Apply black/white background filtering
