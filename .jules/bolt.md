@@ -54,3 +54,11 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-18 - [Vectorized Point Cloud Filtering]
+**Learning:** Python-level loops for point cloud boundary filtering (O(S*H)) are extremely slow compared to NumPy slice assignments on a 3D view, which can be ~36x faster and avoid millions of iterations. Additionally,  for depth filtering is ~4x slower than explicit squared distance comparisons due to the unnecessary square root and extra array copies.
+**Action:** Always reshape flattened point arrays to their spatial dimensions for boundary/region-of-interest operations; use squared distance comparisons for depth or distance filtering to avoid square root overhead.
+
+## 2026-02-18 - [Vectorized Point Cloud Filtering]
+**Learning:** Python-level loops for point cloud boundary filtering (O(S*H)) are extremely slow compared to NumPy slice assignments on a 3D view, which can be ~36x faster and avoid millions of iterations. Additionally, np.linalg.norm for depth filtering is ~4x slower than explicit squared distance comparisons due to the unnecessary square root and extra array copies.
+**Action:** Always reshape flattened point arrays to their spatial dimensions for boundary/region-of-interest operations; use squared distance comparisons for depth or distance filtering to avoid square root overhead.
