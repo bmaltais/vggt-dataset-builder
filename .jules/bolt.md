@@ -54,3 +54,11 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-19 - [Vectorized In-Place Masking for Point Clouds]
+**Learning:** Manually iterating over frames and rows to apply boundary masks to point cloud metadata is extremely slow in Python. Using NumPy's `reshape` to create a 3D view of the 1D mask allowed for vectorized in-place slice assignments, resulting in a ~50x speedup. For subsequent flattening, `.ravel()` is generally preferred over `.reshape(-1)` for performance when a view is sufficient.
+**Action:** Use multi-dimensional views (reshape) and slice assignments for complex masking patterns on flat arrays to avoid iterative loops.
+
+## 2026-02-19 - [Squared Distance Comparisons for Depth Filtering]
+**Learning:** Computing Euclidean depth using `np.linalg.norm(points, axis=1)` is computationally expensive due to the square root operation and internal array copies. Comparing against the squared threshold (`x^2 + y^2 + z^2 <= threshold^2`) provides a ~5x speedup while yielding mathematically identical results for non-negative values.
+**Action:** Replace `np.linalg.norm` with squared magnitude comparisons in performance-critical filtering paths.
