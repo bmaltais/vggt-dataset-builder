@@ -660,6 +660,9 @@ def main() -> None:
             self.renderer: HoleFillingRenderer | None = None
             self.render_size: tuple[int, int] | None = None
             self.ctx: moderngl.Context | None = None
+            self.cached_vao: moderngl.VertexArray | None = None
+            self.cached_buffers: list[moderngl.Buffer] = []
+            self.cached_vao_type: str = ""  # "rgb" or "depth"
 
             # Source aspect ratio (prefer input image aspect when provided)
             if display_aspect is not None and display_aspect > 0.0:
@@ -1000,11 +1003,38 @@ def main() -> None:
                 if self.s0_base > 0.0:
                     self.renderer.s0 = self.s0_base
                 self.render_size = (eff_w, eff_h)
+
+                # Clear cached VAO when renderer is recreated
+                self._clear_cached_vao()
+
             if self.renderer is not None:
                 self.renderer.ctx.point_size = float(self.point_size)
 
+        def _clear_cached_vao(self):
+            if self.cached_vao:
+                self.cached_vao.release()
+                self.cached_vao = None
+            for b in self.cached_buffers:
+                b.release()
+            self.cached_buffers = []
+            self.cached_vao_type = ""
+
         def _render_frame(self) -> None:
             colors = self.depth_colors if self.use_depth_colors else self.rgb_colors
+            color_type = "depth" if self.use_depth_colors else "rgb"
+
+            # ⚡ Bolt: Cache the VAO on the GPU to avoid redundant re-uploads of large point clouds.
+            if (
+                self.renderer is not None
+                and (self.cached_vao is None or self.cached_vao_type != color_type)
+                and self.vertices.size > 0
+            ):
+                self._clear_cached_vao()
+                self.cached_vao, self.cached_buffers = self.renderer.create_point_vao(
+                    self.vertices, colors, self.confidences
+                )
+                self.cached_vao_type = color_type
+
             near = 0.01
             far = 10000.0
             # Use the computed effective render size (preserves source aspect)
@@ -1073,13 +1103,20 @@ def main() -> None:
                         proj,
                         fov_y,
                         viewport=(vp_x, vp_y, vp_w, vp_h),
+                        vao=self.cached_vao,
                     )
                 except Exception as e:
                     print(f"[viewer] render_to_screen failed: {e}")
             else:
                 # Fallback to CPU render+blit
                 frame = self.renderer.render(
-                    self.vertices, colors, self.confidences, view, proj, fov_y
+                    self.vertices,
+                    colors,
+                    self.confidences,
+                    view,
+                    proj,
+                    fov_y,
+                    vao=self.cached_vao,
                 )
                 try:
                     frame = np.ascontiguousarray(frame)
@@ -1317,6 +1354,7 @@ def main() -> None:
 
         def on_close(self):
             self._save_current_frame()
+            self._clear_cached_vao()
             return super().on_close()
 
         def _update_camera(self, dt):
