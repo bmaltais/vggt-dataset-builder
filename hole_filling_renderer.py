@@ -164,6 +164,35 @@ void main() {
         self.jfa_step_passes = [self._init_jfa_seed_pass(), self._init_jfa_seed_pass()]
         self.jfa_resolve_pass = self._init_jfa_resolve_pass()
 
+    def create_point_vao(
+        self, points: np.ndarray, colors: np.ndarray, confidences: np.ndarray
+    ) -> tuple[moderngl.VertexArray, list[moderngl.Buffer]]:
+        """Create a persistent GPU Vertex Array Object for a point cloud.
+
+        ⚡ Bolt: Use this to upload point cloud data once and reuse it across frames,
+        avoiding redundant H-to-D transfers and VAO creation overhead.
+
+        Returns:
+            A tuple of (vao, [buffers]) where buffers should be released when no longer needed.
+        """
+        points = np.asarray(points, dtype=np.float32)
+        colors = np.asarray(colors, dtype=np.float32)
+        confidences = np.asarray(confidences, dtype=np.float32).reshape(-1, 1)
+
+        pos_buffer = self.ctx.buffer(points)
+        color_buffer = self.ctx.buffer(colors)
+        conf_buffer = self.ctx.buffer(confidences)
+
+        vao = self.ctx.vertex_array(
+            self.points_program,
+            [
+                (pos_buffer, "3f", "a_position"),
+                (color_buffer, "3f", "a_color"),
+                (conf_buffer, "1f", "a_confidence"),
+            ],
+        )
+        return vao, [pos_buffer, color_buffer, conf_buffer]
+
     def render(
         self,
         points: np.ndarray,
@@ -172,6 +201,7 @@ void main() {
         view_mat: np.ndarray,
         proj_mat: np.ndarray,
         fov_y: float,
+        vao: moderngl.VertexArray | None = None,
     ) -> np.ndarray:
         """Renders a point cloud into a 2D image from a specific viewpoint.
 
@@ -182,29 +212,17 @@ void main() {
             view_mat: 4x4 camera view matrix (world-to-camera).
             proj_mat: 4x4 camera projection matrix.
             fov_y: Vertical field of view in radians.
+            vao: Optional pre-allocated VAO. If provided, points/colors/confidences are ignored.
 
         Returns:
             H x W x 3 numpy array containing the rendered RGB image (uint8, 0-255).
         """
-        if points.size == 0:
-            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
-
-        points = np.asarray(points, dtype=np.float32)
-        colors = np.asarray(colors, dtype=np.float32)
-        confidences = np.asarray(confidences, dtype=np.float32).reshape(-1, 1)
-
-        pos_buffer = self.ctx.buffer(points.tobytes())
-        color_buffer = self.ctx.buffer(colors.tobytes())
-        conf_buffer = self.ctx.buffer(confidences.tobytes())
-
-        vao = self.ctx.vertex_array(
-            self.points_program,
-            [
-                (pos_buffer, "3f", "a_position"),
-                (color_buffer, "3f", "a_color"),
-                (conf_buffer, "1f", "a_confidence"),
-            ],
-        )
+        if vao is None:
+            if points.size == 0:
+                return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            vao, buffers = self.create_point_vao(points, colors, confidences)
+        else:
+            buffers = []
 
         try:
             self._render_points_pass(vao, view_mat, proj_mat)
@@ -216,10 +234,12 @@ void main() {
             self._render_final_mask()
             return self._read_final_color()
         finally:
-            vao.release()
-            pos_buffer.release()
-            color_buffer.release()
-            conf_buffer.release()
+            if not buffers:  # Internal buffers only
+                pass
+            else:
+                vao.release()
+                for b in buffers:
+                    b.release()
 
     def render_to_screen(
         self,
@@ -230,31 +250,19 @@ void main() {
         proj_mat: np.ndarray,
         fov_y: float,
         viewport: tuple[int, int, int, int] | None = None,
+        vao: moderngl.VertexArray | None = None,
     ) -> None:
         """Render the point cloud directly into the current OpenGL default framebuffer.
 
         This uses the renderer's ModernGL context and draws the final texture
         to the screen without copying to CPU.
         """
-        if points.size == 0:
-            return
-
-        points = np.asarray(points, dtype=np.float32)
-        colors = np.asarray(colors, dtype=np.float32)
-        confidences = np.asarray(confidences, dtype=np.float32).reshape(-1, 1)
-
-        pos_buffer = self.ctx.buffer(points.tobytes())
-        color_buffer = self.ctx.buffer(colors.tobytes())
-        conf_buffer = self.ctx.buffer(confidences.tobytes())
-
-        vao = self.ctx.vertex_array(
-            self.points_program,
-            [
-                (pos_buffer, "3f", "a_position"),
-                (color_buffer, "3f", "a_color"),
-                (conf_buffer, "1f", "a_confidence"),
-            ],
-        )
+        if vao is None:
+            if points.size == 0:
+                return
+            vao, buffers = self.create_point_vao(points, colors, confidences)
+        else:
+            buffers = []
 
         try:
             self._render_points_pass(vao, view_mat, proj_mat)
@@ -286,10 +294,12 @@ void main() {
             quad = self._quad_vao(self.blit_program)
             quad.render(mode=moderngl.TRIANGLE_STRIP)
         finally:
-            vao.release()
-            pos_buffer.release()
-            color_buffer.release()
-            conf_buffer.release()
+            if not buffers:
+                pass
+            else:
+                vao.release()
+                for b in buffers:
+                    b.release()
 
     def _load_program(self, vert_path: Path, frag_path: Path) -> moderngl.Program:
         """Loads and compiles a ModernGL program from vertex and fragment shader files."""
