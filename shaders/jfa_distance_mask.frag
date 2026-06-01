@@ -14,8 +14,9 @@ void main(void) {
 	float factor = exp(-0.5 * normalized * normalized);
 
 	vec4 sample_source = texelFetch(u_tex_source, coord, 0);
-	// ⚡ Bolt: Perform alpha premultiplication and distance masking on the GPU.
+	// ⚡ Bolt: Offload color processing to the GPU.
 	// We use factor * factor to match the original CPU-side behavior where factor
-	// was effectively applied twice (once in shader, once during alpha multiplication).
-	o_dest = vec4(sample_source.xyz * sample_source.w * factor * factor, 1.0);
+	// was effectively applied twice. Clamping to [0.0, 1.0] ensures correct mapping
+	// to the uint8 output texture during fixed-function conversion.
+	o_dest = vec4(clamp(sample_source.xyz * sample_source.w * factor * factor, 0.0, 1.0), 1.0);
 }
