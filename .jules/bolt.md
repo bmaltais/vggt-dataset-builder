@@ -54,3 +54,7 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-18 - [Incompatible isort Configuration]
+**Learning:** The `isort` configuration in `pyproject.toml` (specifically `multi_line_mode = 3`) is incompatible with version 8.0.1+, leading to `UnsupportedSettings` exceptions. Use `isort --profile black --sp /dev/null` to ignore the invalid configuration and format successfully.
+**Action:** Always check for `UnsupportedSettings` when running `isort` and override the config path if necessary to maintain formatting standards.
