@@ -157,8 +157,11 @@ void main() {
         )
         self.push_color_passes = self._init_push_passes()
         self.pull_color_passes = self._init_pull_passes()
+        # ⚡ Bolt: Use a 3-channel normalized uint8 texture for the final pass.
+        # This reduces GPU-to-CPU bandwidth by ~5.3x and allows us to skip
+        # expensive float32-to-uint8 conversion on the CPU.
         self.final_mask_pass = self._init_single_pass(
-            self.width, self.height, [(4, "f4")]
+            self.width, self.height, [(3, "u1")]
         )
         self.jfa_init_pass = self._init_jfa_seed_pass()
         self.jfa_step_passes = [self._init_jfa_seed_pass(), self._init_jfa_seed_pass()]
@@ -687,18 +690,21 @@ void main() {
         quad.render(mode=moderngl.TRIANGLE_STRIP)
 
     def _read_final_color(self) -> np.ndarray:
+        """Reads the final rendered image from the GPU to a CPU NumPy array.
+
+        ⚡ Bolt: Read directly as 3-channel uint8 with 1-byte alignment.
+        This is significantly faster as it avoids redundant float32 allocations,
+        GPU-to-CPU bandwidth overhead, and expensive CPU-side math.
+        """
         texture = self.final_mask_pass.color_textures[0]
-        data = texture.read()
-        rgba = np.frombuffer(data, dtype=np.float32).reshape(
-            (texture.height, texture.width, 4)
+        # Use alignment=1 to ensure robustness with arbitrary widths
+        data = texture.read(alignment=1)
+        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
+            (texture.height, texture.width, 3)
         )
-        rgba = np.flipud(rgba)
-        # ⚡ Bolt: Optimize readback by avoiding redundant CPU-side multiplication.
-        # The jfa_distance_mask.frag shader already performs alpha premultiplication
-        # and distance masking on the GPU, and outputs 1.0 in the alpha channel.
-        # This allows us to take the RGB channels directly, saving significant CPU cycles.
-        rgb = rgba[..., :3]
-        return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        # Flip vertically to match image coordinate conventions and return a copy
+        # to ensure the array is writable and contiguous.
+        return np.flipud(rgb).copy()
 
     def read_final_color(self) -> np.ndarray:
         """Public wrapper that returns the final rendered RGB image as uint8.
