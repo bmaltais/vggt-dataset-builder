@@ -54,3 +54,7 @@
 ## 2026-02-18 - [Optimized Color Summation for Background Filtering]
 **Learning:** For small, fixed-dimension arrays like RGB (Nx3), NumPy's generalized `sum(axis=1)` reduction is significantly slower (~4x) than explicit channel-wise addition (`c0 + c1 + c2`) due to reduction overhead. However, when working with `uint8` data, direct addition will cause overflow wrapping; explicit casting (e.g., to `uint32`) is required before manual addition to ensure correctness while maintaining performance.
 **Action:** Replace `sum(axis=1)` with explicit channel addition for small RGB arrays to improve filtering performance; ensure proper casting for integer types to prevent overflow.
+
+## 2026-02-19 - [Vectorized Boundary and Depth Filtering]
+**Learning:** Python-level nested loops for spatial filtering (like boundary checks) are extremely slow for large point clouds (millions of points). Reshaping a 1D mask to a 3D view and using NumPy slice assignments is O(1) in Python and highly efficient. Additionally, using squared distance (`np.einsum('ij,ij->i', points, points)`) avoids expensive square root operations and temporary array copies.
+**Action:** Use zero-copy reshaped views for spatial masking and `np.einsum` for squared distance to optimize filtering pipelines.
