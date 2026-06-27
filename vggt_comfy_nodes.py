@@ -26,9 +26,10 @@ from dataset_utils import setup_vggt_path
 # Ensure local vggt/ submodule is importable
 setup_vggt_path()
 
+from vggt.utils.geometry import unproject_depth_map_to_point_map
+
 # Import VGGT utilities
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 # Global caching for VGGT model: Keeps the loaded model in memory to avoid expensive
 # reloads during repeated ComfyUI node executions. The model is moved between devices
@@ -129,7 +130,7 @@ def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
         >>> write_ply_basic("output.ply", points, colors, confs, scale_multiplier=1.0)
     """
     import numpy as np
-    from plyfile import PlyElement, PlyData
+    from plyfile import PlyData, PlyElement
 
     n_points = len(points)
 
@@ -789,41 +790,31 @@ class VGGT_Model_Inference:
 
         # Apply max depth filtering to all frames
         if max_depth > 0:
-            # Compute depth as distance from camera (simple approximation)
-            depth_all = np.linalg.norm(points_all_frames, axis=1)
-            valid_mask_all = valid_mask_all & (depth_all <= max_depth)
+            # ⚡ Bolt: Use squared distance to avoid expensive square root
+            dist_sq = np.einsum("ij,ij->i", points_all_frames, points_all_frames)
+            valid_mask_all &= dist_sq <= max_depth**2
             print(f"[VGGT] Applied max_depth filter: {max_depth}")
 
         # Apply boundary filtering to all frames
         if boundary_threshold > 0:
-            # Create boundary mask for each frame
-            boundary_mask = np.ones(S * H * W, dtype=bool)
-            for s in range(S):
-                frame_offset = s * H * W
-                # Top and bottom
-                boundary_mask[frame_offset : frame_offset + boundary_threshold * W] = (
-                    False
-                )
-                boundary_mask[
-                    frame_offset + (H - boundary_threshold) * W : frame_offset + H * W
-                ] = False
-                # Left and right (per row)
-                for h in range(boundary_threshold, H - boundary_threshold):
-                    row_start = frame_offset + h * W
-                    boundary_mask[row_start : row_start + boundary_threshold] = False
-                    boundary_mask[
-                        row_start + W - boundary_threshold : row_start + W
-                    ] = False
-            valid_mask_all = valid_mask_all & boundary_mask
+            # ⚡ Bolt: Vectorized boundary filtering using 3D view slice assignment
+            mask_view = valid_mask_all.view().reshape(S, H, W)
+            mask_view[:, :boundary_threshold, :] = False
+            mask_view[:, -boundary_threshold:, :] = False
+            mask_view[:, :, :boundary_threshold] = False
+            mask_view[:, :, -boundary_threshold:] = False
             print(f"[VGGT] Applied boundary_threshold filter: {boundary_threshold}px")
 
         # Apply black/white background filtering
         if mask_black_bg:
             # ⚡ Bolt: Explicit channel-wise addition (c0 + c1 + c2) is ~4x faster than sum(axis=1)
             # for small fixed dimensions like RGB.
-            color_sum = colors_all_frames[:, 0] + colors_all_frames[:, 1] + colors_all_frames[:, 2]
-            black_mask = color_sum >= (16 / 255.0)
-            valid_mask_all = valid_mask_all & black_mask
+            color_sum = (
+                colors_all_frames[:, 0]
+                + colors_all_frames[:, 1]
+                + colors_all_frames[:, 2]
+            )
+            valid_mask_all &= color_sum >= (16 / 255.0)
             print(f"[VGGT] Applied mask_black_bg filter")
 
         if mask_white_bg:
@@ -832,16 +823,17 @@ class VGGT_Model_Inference:
                 & (colors_all_frames[:, 1] > 240 / 255.0)
                 & (colors_all_frames[:, 2] > 240 / 255.0)
             )
-            valid_mask_all = valid_mask_all & white_mask
+            valid_mask_all &= white_mask
             print(f"[VGGT] Applied mask_white_bg filter")
 
         # Apply sky filtering if enabled
         if mask_sky:
             try:
-                import cv2
-                import onnxruntime as ort
                 from pathlib import Path
+
+                import cv2
                 import folder_paths
+                import onnxruntime as ort
 
                 # Use ComfyUI's models directory for caching
                 models_dir = Path(folder_paths.models_dir)
@@ -927,7 +919,7 @@ class VGGT_Model_Inference:
                         frame_keep_mask.flatten()
                     )
 
-                valid_mask_all = valid_mask_all & sky_mask_all
+                valid_mask_all &= sky_mask_all
                 print(
                     f"[VGGT] Applied mask_sky filter (filtered {total_sky_points} sky points across all frames)"
                 )
@@ -967,8 +959,9 @@ class VGGT_Model_Inference:
             confidences = confidences.flatten()
 
         # Save PLY file
-        import folder_paths
         import uuid
+
+        import folder_paths
 
         output_dir = folder_paths.get_output_directory()
         temp_id = str(uuid.uuid4())[:8]
