@@ -26,9 +26,10 @@ from dataset_utils import setup_vggt_path
 # Ensure local vggt/ submodule is importable
 setup_vggt_path()
 
+from vggt.utils.geometry import unproject_depth_map_to_point_map
+
 # Import VGGT utilities
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 # Global caching for VGGT model: Keeps the loaded model in memory to avoid expensive
 # reloads during repeated ComfyUI node executions. The model is moved between devices
@@ -129,7 +130,7 @@ def write_ply_basic(path, points, colors, confs, scale_multiplier=0.5):
         >>> write_ply_basic("output.ply", points, colors, confs, scale_multiplier=1.0)
     """
     import numpy as np
-    from plyfile import PlyElement, PlyData
+    from plyfile import PlyData, PlyElement
 
     n_points = len(points)
 
@@ -562,149 +563,150 @@ class VGGT_Model_Inference:
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        # Convert to numpy for colors BEFORE deleting model_input
-        # Images are in (N, C, H, W) format from model_input
-        model_input_np = model_input.cpu().numpy().transpose(0, 2, 3, 1)  # (N, H, W, C)
+        # ===== GPU-ACCELERATED UPSAMPLING =====
+        # ⚡ Bolt: Vectorizing upsampling and keeping it on GPU avoids redundant host-device transfers.
+        if upsample_depth and len(original_dims) > 0:
+            # Extract depth and confidence (still tensors on GPU)
+            depth_t = predictions["depth"].float()  # (1, S, H, W, 1)
+            conf_t = predictions["depth_conf"].float()  # (1, S, H, W)
+            color_t = model_input.float()  # (S, 3, H, W)
 
-        # Convert tensors to numpy - EXACTLY like demo does
-        print("[VGGT] Converting predictions to numpy...")
-        for key in predictions.keys():
-            if isinstance(predictions[key], torch.Tensor):
-                predictions[key] = (
-                    predictions[key].cpu().numpy().squeeze(0)
-                )  # remove batch dimension
-        predictions["pose_enc_list"] = None  # remove pose_enc_list
+            # Check if all images have the same resolution for batching
+            all_same_resolution = all(dim == original_dims[0] for dim in original_dims)
+
+            if all_same_resolution:
+                print(
+                    "[VGGT] Upsampling depth and confidence maps to original resolution (GPU-batched)..."
+                )
+                orig_height, orig_width = original_dims[0]
+
+                # (1, S, H, W, 1) -> (S, 1, H, W)
+                depth_t = depth_t.squeeze(0).permute(0, 3, 1, 2)
+                # (1, S, H, W) -> (S, 1, H, W)
+                conf_t = conf_t.squeeze(0).unsqueeze(1)
+
+                # Batched interpolation on GPU
+                depth_t = F.interpolate(
+                    depth_t,
+                    size=(orig_height, orig_width),
+                    mode="bicubic",
+                    align_corners=False,
+                )
+                conf_t = F.interpolate(
+                    conf_t, size=(orig_height, orig_width), mode="nearest"
+                )
+                color_t = F.interpolate(
+                    color_t,
+                    size=(orig_height, orig_width),
+                    mode="bicubic",
+                    align_corners=False,
+                )
+
+                # Adjust intrinsics for all frames at once
+                current_h, current_w = model_input.shape[-2:]
+                scale_h = orig_height / current_h
+                scale_w = orig_width / current_w
+                intrinsic[:, 0, 0] *= scale_w  # fx
+                intrinsic[:, 1, 1] *= scale_h  # fy
+                intrinsic[:, 0, 2] *= scale_w  # cx
+                intrinsic[:, 1, 2] *= scale_h  # cy
+
+                # Reshape back to expected formats
+                depth_map_tensor = depth_t.permute(0, 2, 3, 1)  # (S, H_orig, W_orig, 1)
+                conf_tensor = conf_t.permute(0, 2, 3, 1)  # (S, H_orig, W_orig, 1)
+                colors_tensor = color_t.permute(0, 2, 3, 1)  # (S, H_orig, W_orig, 3)
+
+                print(
+                    f"[VGGT] Upsampled to original resolution: {orig_width}x{orig_height}"
+                )
+            else:
+                print("[VGGT] Upsampling depth and confidence maps (GPU-sequential)...")
+                # Fallback to sequential but still on GPU
+                depth_map_upsampled = []
+                depth_conf_upsampled = []
+                colors_upsampled = []
+
+                # (1, S, H, W, 1) -> (S, 1, H, W)
+                depth_t_all = depth_t.squeeze(0).permute(0, 3, 1, 2)
+                # (1, S, H, W) -> (S, 1, H, W)
+                conf_t_all = conf_t.squeeze(0).unsqueeze(1)
+
+                for frame_idx, (orig_height, orig_width) in enumerate(original_dims):
+                    depth_frame = depth_t_all[frame_idx : frame_idx + 1]
+                    conf_frame = conf_t_all[frame_idx : frame_idx + 1]
+                    color_frame = color_t[frame_idx : frame_idx + 1]
+
+                    depth_up = F.interpolate(
+                        depth_frame,
+                        size=(orig_height, orig_width),
+                        mode="bicubic",
+                        align_corners=False,
+                    )
+                    conf_up = F.interpolate(
+                        conf_frame, size=(orig_height, orig_width), mode="nearest"
+                    )
+                    color_up = F.interpolate(
+                        color_frame,
+                        size=(orig_height, orig_width),
+                        mode="bicubic",
+                        align_corners=False,
+                    )
+
+                    depth_map_upsampled.append(depth_up)
+                    depth_conf_upsampled.append(conf_up)
+                    colors_upsampled.append(color_up)
+
+                    # Adjust intrinsics
+                    current_h, current_w = model_input.shape[-2:]
+                    scale_h = orig_height / current_h
+                    scale_w = orig_width / current_w
+                    intrinsic[frame_idx, 0, 0] *= scale_w
+                    intrinsic[frame_idx, 1, 1] *= scale_h
+                    intrinsic[frame_idx, 0, 2] *= scale_w
+                    intrinsic[frame_idx, 1, 2] *= scale_h
+
+                depth_map_tensor = torch.cat(depth_map_upsampled, dim=0).permute(
+                    0, 2, 3, 1
+                )
+                conf_tensor = torch.cat(depth_conf_upsampled, dim=0).permute(0, 2, 3, 1)
+                colors_tensor = torch.cat(colors_upsampled, dim=0).permute(0, 2, 3, 1)
+
+            # Move results to CPU and convert to numpy
+            depth_map = depth_map_tensor.cpu().numpy()
+            predictions["depth_conf"] = conf_tensor.cpu().numpy()
+            model_input_np = colors_tensor.cpu().numpy()
+            intrinsic_np = intrinsic.cpu().numpy()
+
+            # Clean up intermediate tensors
+            del depth_t, conf_t, color_t
+            if "depth_map_tensor" in locals():
+                del depth_map_tensor, conf_tensor, colors_tensor
+        else:
+            # NO UPSAMPLING: Standard conversion to numpy
+            print("[VGGT] Skipping upsampling, converting to numpy...")
+            # (1, S, H, W, 1) -> (S, H, W, 1)
+            depth_map = predictions["depth"].squeeze(0).cpu().numpy()
+            # (1, S, H, W) -> (S, H, W, 1)
+            predictions["depth_conf"] = (
+                predictions["depth_conf"].squeeze(0).unsqueeze(-1).cpu().numpy()
+            )
+            # (S, 3, H, W) -> (S, H, W, 3)
+            model_input_np = model_input.cpu().numpy().transpose(0, 2, 3, 1)
+            intrinsic_np = intrinsic.cpu().numpy()
+
+        # Convert extrinsic matrix to numpy
+        extrinsic_np = extrinsic.cpu().numpy()
+        predictions["extrinsic"] = extrinsic_np
+        predictions["intrinsic"] = intrinsic_np
+
+        # Clean up pose_enc_list
+        predictions["pose_enc_list"] = None
 
         # Generate world points from depth map - EXACTLY like demo does
         print(
             "[VGGT] Computing world points from depth map (depth-based unprojection)..."
         )
-        depth_map = predictions["depth"]  # (S, H, W, 1)
-
-        # Initialize intrinsic_np with original values
-        intrinsic_np = predictions["intrinsic"]  # (S, 3, 3)
-
-        # ===== UPSAMPLE DEPTH IF REQUESTED =====
-        if upsample_depth and len(original_dims) > 0:
-            # Check if all images have the same resolution
-            all_same_resolution = all(dim == original_dims[0] for dim in original_dims)
-
-            if all_same_resolution:
-                print(
-                    "[VGGT] Upsampling depth and confidence maps to original resolution..."
-                )
-                depth_map_upsampled = []
-                depth_conf_upsampled = []
-                colors_upsampled = []
-                intrinsic_upsampled = []
-
-                for frame_idx, (orig_height, orig_width) in enumerate(original_dims):
-                    # Extract this frame's depth and confidence
-                    depth_frame = depth_map[frame_idx]  # (H, W, 1) or (H, W)
-                    conf_frame = predictions["depth_conf"][
-                        frame_idx
-                    ]  # (H, W, 1) or (H, W)
-                    color_frame = model_input_np[frame_idx]  # (H, W, 3)
-
-                    # Ensure they have proper dimensions
-                    if depth_frame.ndim == 2:
-                        depth_frame = np.expand_dims(depth_frame, -1)  # (H, W, 1)
-                    if conf_frame.ndim == 2:
-                        conf_frame = np.expand_dims(conf_frame, -1)  # (H, W, 1)
-
-                    # Add batch dimension for interpolation: (H, W, C) -> (1, C, H, W)
-                    depth_frame_t = (
-                        torch.from_numpy(depth_frame)
-                        .permute(2, 0, 1)
-                        .unsqueeze(0)
-                        .float()
-                    )
-                    conf_frame_t = (
-                        torch.from_numpy(conf_frame)
-                        .permute(2, 0, 1)
-                        .unsqueeze(0)
-                        .float()
-                    )
-                    color_frame_t = (
-                        torch.from_numpy(color_frame)
-                        .permute(2, 0, 1)
-                        .unsqueeze(0)
-                        .float()
-                    )
-
-                    # Upsample to original resolution
-                    depth_frame_up = F.interpolate(
-                        depth_frame_t,
-                        size=(orig_height, orig_width),
-                        mode="bicubic",
-                        align_corners=False,
-                    )
-                    conf_frame_up = F.interpolate(
-                        conf_frame_t, size=(orig_height, orig_width), mode="nearest"
-                    )
-                    color_frame_up = F.interpolate(
-                        color_frame_t,
-                        size=(orig_height, orig_width),
-                        mode="bicubic",
-                        align_corners=False,
-                    )
-
-                    # Convert back to numpy: (1, C, H, W) -> (H, W, C)
-                    depth_map_upsampled.append(
-                        depth_frame_up.permute(0, 2, 3, 1).squeeze(0).numpy()
-                    )
-                    depth_conf_upsampled.append(
-                        conf_frame_up.permute(0, 2, 3, 1).squeeze(0).numpy()
-                    )
-                    colors_upsampled.append(
-                        color_frame_up.permute(0, 2, 3, 1).squeeze(0).numpy()
-                    )
-
-                    # Clean up intermediate tensors immediately
-                    del depth_frame_t, conf_frame_t, color_frame_t
-                    del depth_frame_up, conf_frame_up, color_frame_up
-
-                    # Adjust intrinsics for upsampled resolution
-                    intrinsic_frame = intrinsic_np[frame_idx].copy()
-                    current_h, current_w = model_input_np[frame_idx].shape[:2]
-                    scale_h = orig_height / current_h
-                    scale_w = orig_width / current_w
-                    intrinsic_frame[0, 0] *= scale_w  # fx
-                    intrinsic_frame[1, 1] *= scale_h  # fy
-                    intrinsic_frame[0, 2] *= scale_w  # cx
-                    intrinsic_frame[1, 2] *= scale_h  # cy
-                    intrinsic_upsampled.append(intrinsic_frame)
-
-                # Stack upsampled arrays
-                depth_map = np.stack(depth_map_upsampled)  # (S, H_orig, W_orig, 1)
-                predictions["depth_conf"] = np.stack(
-                    depth_conf_upsampled
-                )  # (S, H_orig, W_orig, 1)
-                model_input_np = np.stack(colors_upsampled)  # (S, H_orig, W_orig, 3)
-                intrinsic_np = np.stack(intrinsic_upsampled)
-
-                # Clean up temporary upsampling lists
-                del (
-                    depth_map_upsampled,
-                    depth_conf_upsampled,
-                    colors_upsampled,
-                    intrinsic_upsampled,
-                )
-
-                print(
-                    f"[VGGT] Upsampled depth to original resolution: {depth_map.shape}"
-                )
-                print(f"[VGGT] Upsampled colors to match: {model_input_np.shape}")
-            else:
-                print(
-                    f"[VGGT] ⚠️ WARNING: Multiple images have different resolutions, skipping upsampling:"
-                )
-                for idx, (h, w) in enumerate(original_dims):
-                    print(f"[VGGT]   Image {idx+1}: {w}x{h}")
-                print(
-                    f"[VGGT] To use upsampling, provide images with the same resolution"
-                )
-
+        # Note: unproject_depth_map_to_point_map expects (S, H, W, 1) and handles numpy arrays
         world_points = unproject_depth_map_to_point_map(
             depth_map, predictions["extrinsic"], intrinsic_np
         )
@@ -821,7 +823,11 @@ class VGGT_Model_Inference:
         if mask_black_bg:
             # ⚡ Bolt: Explicit channel-wise addition (c0 + c1 + c2) is ~4x faster than sum(axis=1)
             # for small fixed dimensions like RGB.
-            color_sum = colors_all_frames[:, 0] + colors_all_frames[:, 1] + colors_all_frames[:, 2]
+            color_sum = (
+                colors_all_frames[:, 0]
+                + colors_all_frames[:, 1]
+                + colors_all_frames[:, 2]
+            )
             black_mask = color_sum >= (16 / 255.0)
             valid_mask_all = valid_mask_all & black_mask
             print(f"[VGGT] Applied mask_black_bg filter")
@@ -838,10 +844,11 @@ class VGGT_Model_Inference:
         # Apply sky filtering if enabled
         if mask_sky:
             try:
-                import cv2
-                import onnxruntime as ort
                 from pathlib import Path
+
+                import cv2
                 import folder_paths
+                import onnxruntime as ort
 
                 # Use ComfyUI's models directory for caching
                 models_dir = Path(folder_paths.models_dir)
@@ -967,8 +974,9 @@ class VGGT_Model_Inference:
             confidences = confidences.flatten()
 
         # Save PLY file
-        import folder_paths
         import uuid
+
+        import folder_paths
 
         output_dir = folder_paths.get_output_directory()
         temp_id = str(uuid.uuid4())[:8]
